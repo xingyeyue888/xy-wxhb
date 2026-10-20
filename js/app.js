@@ -4001,6 +4001,7 @@ window.__wy = {
   applyBgImg,
   shrinkImage,
   pickBgImg,
+  bgIdb,
   renderLibItems,
   libLoadProjects,
   libLoadItems,

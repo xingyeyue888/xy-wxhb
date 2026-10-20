@@ -37,7 +37,12 @@ export class CanvasView {
   /* ---------------- 视图 ---------------- */
   apply() {
     const { x, y, k } = this.view;
-    this.world.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${k})`;
+    /* zoom 是「布局级」缩放：文字按放大后的物理尺寸重新排版渲染，
+       不会像 transform:scale 那样把位图拉伸糊掉。
+       位移仍走 transform——但 zoom 会连 transform 的长度值一起缩放，
+       所以这里除以 k，屏幕上看到的正好是 x/y 像素的平移。 */
+    this.world.style.zoom = k;
+    this.world.style.transform = `translate3d(${x / k}px, ${y / k}px, 0)`;
     const grid = 24 * k;
     this.stage.style.setProperty("--grid", grid + "px");
     this.stage.style.setProperty("--grid-x", x + "px");
