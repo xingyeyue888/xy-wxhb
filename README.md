@@ -210,9 +210,24 @@
 - **删子库内部的文件夹**：文件列表顶部有一排「文件夹」chip（从文件路径反推出多级目录，如 `图片/Qwen2.1/2026-10-08`），
   每个后面都有 **✕** → 连文件夹带内容一起删。侧栏的 ✕ 管一级子库，这排 chip 管子库内部的多级目录
 
+### 成品库：把满意的产出单独收出来
+
+`output/` 是全输出库——跑多少次都在里面，废稿成品混在一块。**成品库**就是 `output/成品库/`，
+专门放挑出来的：
+
+- 素材节点接住产出后，按钮行有一个 **⭐ 存到成品库**（结果节点上也有）→ 复制进去，**源文件不动**
+- 同名不覆盖：库里已有同名文件就自动加 `_1`、`_2` 后缀，绝不盖掉已收的
+- 存过的按钮变成绿色的 **已存 ✓**，悬停显示收进去的文件名；再点一次会另存一份
+- 「已存」状态跟着画布存档走，刷新后还认得
+- 收完在素材库面板切到 **output 结果**，就能看到「成品库」子库（带文件数），
+  里面的图可以直接拖到画布复用
+
+> 为什么这块也要后端：ComfyUI HTTP 接口没有「复制文件」，`POST /api/lib/collect` 由 serve.py 做，
+> 只读源（`input/` `output/` `temp/` 都行）、只写 `output/成品库/`，路径全部过越界校验。
+
 > 为什么这块需要后端：ComfyUI 官方 HTTP 接口只有 `/view`（按文件名取文件），
 > **没有「列目录」和「删文件」**。所以 `serve.py` 直接读本机 `input/` `output/` 目录提供这些能力：
-> `GET /api/lib/root|projects|items`、`POST /api/lib/project|delete`、`DELETE /api/lib/file|project|dir`。
+> `GET /api/lib/root|projects|items`、`POST /api/lib/project|delete|collect`、`DELETE /api/lib/file|project|dir`。
 > 它会自动探测 ComfyUI 根目录（`comfy-root.txt` → 环境变量 `WY_COMFY_ROOT` → 常见路径），
 > 探不到就在面板里让你手填一次，记在 `comfy-root.txt` 里。所有路径都过越界校验，只动 `input/` `output/` 里面。
 

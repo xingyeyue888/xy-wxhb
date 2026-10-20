@@ -2182,7 +2182,7 @@ function renderInputBody(node, el) {
     back.textContent = "改用本地文件";
     back.title = "清掉这次接到的产出，换回这个节点自己的文件";
     back.onclick = () => { node.pulled = null; renderNode(node); save(); };
-    row.append(open, back);
+    row.append(open, makeCollectBtn(node), back);
     body.appendChild(row);
     return;
   }
@@ -2842,7 +2842,7 @@ function renderContentBody(node, el) {
       navigator.clipboard?.writeText(node.value || "");
       toast("已复制", "ok");
     };
-    row.appendChild(cp);
+    row.append(cp, makeCollectBtn(node));
     body.appendChild(row);
     return;
   }
@@ -2882,7 +2882,7 @@ function renderContentBody(node, el) {
   open.className = "btn btn-ghost";
   open.textContent = "打开";
   open.onclick = () => url && window.open(url, "_blank");
-  row.appendChild(open);
+  row.append(open, makeCollectBtn(node));
   body.appendChild(row);
 }
 
@@ -3067,6 +3067,8 @@ async function cloneSnapshot(s, x, y) {
     name: s.name, x, y, w: s.w, h: s.h, params: {},
     value: s.value || "", sub: s.sub || "", sType: s.sType || "", src: s.src || "",
     pulled: s.pulled ? JSON.parse(JSON.stringify(s.pulled)) : null,
+    /* 收进成品库后记的文件名（按钮显示「已存 ✓」） */
+    collected: s.collected || "",
     status: (s.value || isContent || s.pulled) ? "done" : "idle", error: "", result: null,
   };
   S.nodes.push(node);
@@ -3527,6 +3529,57 @@ async function libDeleteMany() {
 }
 
 /** 删素材库内部的一个文件夹（含里面的文件和子目录）——侧栏 ✕ 只删一级子库，这个管多级 */
+/* ==================================================================
+   成品库：把节点上满意的产出收进 output/成品库/
+   output 是全输出库（废稿成品混在一起），成品库单独放挑出来的图。
+   复制不删源；同名自动加 _1 后缀，不覆盖已收的。
+================================================================== */
+const LIB_KEPT = "成品库";
+
+/** 节点上现在装的文件定位（产出优先，其次本地文件） */
+function nodeFileLoc(node) {
+  if (node.pulled && node.pulled.value) {
+    return { kind: node.pulled.sType || "output", sub: node.pulled.sub || "", name: node.pulled.value };
+  }
+  if (node.value) {
+    return { kind: node.sType || "output", sub: node.sub || "", name: node.value };
+  }
+  return null;
+}
+
+async function collectToLib(node) {
+  const f = nodeFileLoc(node);
+  if (!f) { toast("这个节点还没有文件", "err"); return; }
+  try {
+    const r = await libReq("/api/lib/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...f, lib: LIB_KEPT }),
+    });
+    /* 记一笔「已存」，按钮变状态；存档带着走，刷新后还认得 */
+    if (node.pulled) node.pulled.collected = r.name;
+    else node.collected = r.name;
+    renderNode(node);
+    save();
+    toast(`已存到成品库：${r.name}`, "ok");
+  } catch (e) {
+    toast("保存到成品库失败：" + e.message, "err");
+  }
+}
+
+/** 做一个「⭐ 存到成品库」按钮；已存过的显示 ✓ 和最终文件名 */
+function makeCollectBtn(node) {
+  const done = node.pulled ? node.pulled.collected : node.collected;
+  const b = document.createElement("button");
+  b.className = "btn btn-ghost" + (done ? " ok" : "");
+  b.textContent = done ? "已存 ✓" : "⭐ 存到成品库";
+  b.title = done
+    ? `已收进成品库：${done}\n再点一次会另存一份（同名自动加后缀）`
+    : `把这份产出复制进「${LIB_KEPT}」子库（output/${LIB_KEPT}/），源文件不动`;
+  b.onclick = () => collectToLib(node);
+  return b;
+}
+
 async function libDeleteDir(sub) {
   if (!sub) return;
   const n = S.lib.items.filter(it => (it.sub || "") === sub || (it.sub || "").startsWith(sub + "/")).length;
@@ -3671,6 +3724,7 @@ function save() {
       inKind: n.inKind, value: n.value, sub: n.sub, sType: n.sType,
       /* 素材节点接住的产出（上游写进来的），要一起存，不然刷新就没了 */
       pulled: n.pulled,
+      collected: n.collected,
       x: view.getPos(n.id).x, y: view.getPos(n.id).y,
       w: view.getSize(n.id).w, h: view.getSize(n.id).h,
       params: n.params, src: n.src,
@@ -3895,6 +3949,7 @@ function exportCanvas() {
       inKind: n.inKind, value: n.value, sub: n.sub, sType: n.sType,
       /* 素材节点接住的产出（上游写进来的），要一起存，不然刷新就没了 */
       pulled: n.pulled,
+      collected: n.collected,
       x: view.getPos(n.id).x, y: view.getPos(n.id).y,
       w: view.getSize(n.id).w, h: view.getSize(n.id).h,
       params: n.params, src: n.src,
@@ -3998,6 +4053,9 @@ window.__wy = {
   libDeleteProject,
   libDeleteDir,
   applyDay,
+  collectToLib,
+  makeCollectBtn,
+  LIB_KEPT,
   applyBgImg,
   shrinkImage,
   pickBgImg,

@@ -32,7 +32,7 @@ import threading
 import urllib.parse
 import webbrowser
 
-PORT = 8277
+PORT = int(os.environ.get("WY_CANVAS_PORT", "8277"))
 HOST = "127.0.0.1"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ROOT_CFG = os.path.join(ROOT, "comfy-root.txt")
@@ -239,6 +239,41 @@ def lib_delete_many(kind, items):
     return {"deleted": done, "failed": failed}
 
 
+def lib_collect(kind, sub, name, lib="成品库"):
+    """把一个产出文件收进成品库（output/<lib>/）。源可以在 input / output / temp。
+    同名不覆盖：自动加 _1、_2 后缀，绝不静默盖掉已收的成品。"""
+    r = comfy_root()
+    if not r:
+        raise ValueError("没找到 ComfyUI 目录")
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError("文件名不合法")
+    sub = (sub or "").strip().replace("\\", "/").strip("/")
+    src_dir = {
+        "input": os.path.join(r, "input"),
+        "output": os.path.join(r, "output"),
+        "temp": os.path.join(r, "temp"),
+    }.get(kind)
+    if not src_dir:
+        raise ValueError("来源类型不对（只支持 input / output / temp）")
+    src = safe_join(src_dir, sub, name) if sub else safe_join(src_dir, name)
+    if not os.path.isfile(src):
+        raise ValueError("源文件不存在")
+    lib = (lib or "成品库").strip().replace("\\", "/").strip("/")
+    if not lib or "/" in lib or lib in (".", ".."):
+        raise ValueError("库名不合法")
+    dst_dir = os.path.join(kind_dir("output"), lib)
+    os.makedirs(dst_dir, exist_ok=True)
+    base, ext = os.path.splitext(name)
+    final, i = name, 1
+    while os.path.exists(os.path.join(dst_dir, final)):
+        final = f"{base}_{i}{ext}"
+        i += 1
+    dst = safe_join(dst_dir, final)
+    shutil.copy2(src, dst)
+    return {"name": final, "lib": lib, "path": dst, "size": os.path.getsize(dst)}
+
+
 def lib_delete_project(kind, name):
     """整个子库一起删（含里面的子目录）。只允许删一级子目录，根目录永远不碰。"""
     d = kind_dir(kind)
@@ -386,6 +421,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if tail == "delete":                       # 批量删文件
                 kind = body.get("kind", "input")
                 return self._json({"ok": True, **lib_delete_many(kind, body.get("items") or [])})
+            if tail == "collect":                      # 收进成品库（复制，不删源）
+                return self._json({"ok": True, **lib_collect(
+                    body.get("kind", "output"), body.get("sub", ""),
+                    body.get("name", ""), body.get("lib", "成品库"))})
             return self._json({"error": "unknown endpoint"}, 404)
         except Exception as e:
             return self._json({"error": str(e)}, 400)
