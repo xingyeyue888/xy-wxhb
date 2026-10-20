@@ -1,0 +1,461 @@
+"""
+serve.py —— 本地无限画布的静态服务器 + 素材库 API
+
+为什么用 Python 而不是直接 python -m http.server：
+  1. 服务真正就绪后才打开浏览器（避免 ERR_CONNECTION_REFUSED）；
+  2. 端口被占用时给中文提示并直接打开已有服务；
+  3. start.bat 可以保持纯 ASCII，绕开 cmd 按 GBK 解析 UTF-8 中文导致的命令被切碎问题。
+
+素材库为什么要后端：
+  ComfyUI 官方 HTTP 接口只提供 /view（按文件名取文件），没有「列目录」和「删文件」。
+  所以这里直接读本机 ComfyUI 的 input / output 目录，提供：
+    GET    /api/lib/root                   探测到的 ComfyUI 根目录
+    POST   /api/lib/root   {root}          手动指定根目录（写进 comfy-root.txt）
+    GET    /api/lib/projects?kind=input    按一级子目录分「项目」
+    GET    /api/lib/items?kind=input&project=xxx
+    POST   /api/lib/project {kind,name}    新建子库（一级目录）
+    DELETE /api/lib/file?kind=&sub=&name=  删文件
+    POST   /api/lib/delete {kind,items:[{sub,name}]}   批量删文件
+    DELETE /api/lib/project?kind=&name=    整个子库（含子目录）一起删
+  所有路径都做越界校验，只允许动 input / output 里面。
+"""
+
+import http.server
+import json
+import os
+import posixpath
+import shutil
+import socket
+import socketserver
+import sys
+import threading
+import urllib.parse
+import webbrowser
+
+PORT = 8277
+HOST = "127.0.0.1"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT_CFG = os.path.join(ROOT, "comfy-root.txt")
+
+KINDS = ("input", "output")
+
+MEDIA_EXT = {
+    "image": (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".avif"),
+    "video": (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"),
+    "audio": (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"),
+    "text": (".txt", ".md", ".json", ".csv", ".log"),
+}
+
+MAX_ITEMS = 400          # 单个子库最多列这么多条（按修改时间倒序）
+COUNT_CAP = 4000         # 统计子库文件数时最多数这么多，防止超大树卡住
+
+
+# ----------------------------------------------------------------------------
+# ComfyUI 根目录探测
+# ----------------------------------------------------------------------------
+def _load_cfg_root():
+    try:
+        with open(ROOT_CFG, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _candidates():
+    out = []
+    env = os.environ.get("WY_COMFY_ROOT", "").strip()
+    if env:
+        out.append(env)
+    cfg = _load_cfg_root()
+    if cfg:
+        out.append(cfg)
+    # 常见位置：秋叶整合包 / 官方包 / 各盘符根目录
+    for base in ("E:", "D:", "C:", "F:", "G:"):
+        out.append(base + "/ComfyUI-aki-v3.2/ComfyUI")
+        out.append(base + "/ComfyUI-aki-v3.2")
+        out.append(base + "/ComfyUI")
+        out.append(base + "/ComfyUI_windows_portable/ComfyUI")
+    return out
+
+
+def _is_comfy(p):
+    return bool(p) and os.path.isdir(os.path.join(p, "input")) and os.path.isdir(os.path.join(p, "output"))
+
+
+def comfy_root():
+    for c in _candidates():
+        c = (c or "").replace("\\", "/").rstrip("/")
+        if _is_comfy(c):
+            return c
+    return ""
+
+
+def kind_dir(kind):
+    """input / output 的绝对路径；不合法返回 None"""
+    if kind not in KINDS:
+        return None
+    r = comfy_root()
+    if not r:
+        return None
+    return os.path.join(r, kind)
+
+
+def safe_join(base, *parts):
+    """拼路径并确保没跑出 base（防 ../../ 越界）"""
+    clean = [p for p in parts if p not in ("", None)]
+    target = os.path.abspath(os.path.join(base, *[p.replace("\\", "/") for p in clean]))
+    b = os.path.abspath(base)
+    if target != b and not target.startswith(b + os.sep):
+        raise ValueError("路径越界")
+    return target
+
+
+def kind_of(name):
+    ext = os.path.splitext(name)[1].lower()
+    for k, exts in MEDIA_EXT.items():
+        if ext in exts:
+            return k
+    return "other"
+
+
+# ----------------------------------------------------------------------------
+# 素材库操作
+# ----------------------------------------------------------------------------
+def lib_projects(kind):
+    d = kind_dir(kind)
+    if not d or not os.path.isdir(d):
+        return []
+    out = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for n in names:
+        p = os.path.join(d, n)
+        if not os.path.isdir(p):
+            continue
+        cnt, mt = 0, os.path.getmtime(p)
+        for dirpath, _dirs, files in os.walk(p):
+            for fn in files:
+                if kind_of(fn) == "other":
+                    continue
+                cnt += 1
+                try:
+                    mt = max(mt, os.path.getmtime(os.path.join(dirpath, fn)))
+                except OSError:
+                    pass
+                if cnt >= COUNT_CAP:
+                    break
+            if cnt >= COUNT_CAP:
+                break
+        out.append({"name": n, "count": cnt, "mtime": int(mt)})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def lib_items(kind, project, limit=MAX_ITEMS):
+    d = kind_dir(kind)
+    if not d or not os.path.isdir(d):
+        return []
+    base = safe_join(d, project)
+    if not os.path.isdir(base):
+        return []
+    out = []
+    if project:
+        # 子库里递归（output/图片/Qwen2.1/2026-10-20/x.png 这种层级要能看到）
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in files:
+                p = os.path.join(dirpath, fn)
+                out.append(_item(d, p))
+    else:
+        # 根目录只看第一层，不然会把整个 input 翻出来
+        for fn in os.listdir(base):
+            p = os.path.join(base, fn)
+            if os.path.isfile(p):
+                out.append(_item(d, p))
+    out = [x for x in out if x]
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out[:limit]
+
+
+def _item(root_dir, path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    name = os.path.basename(path)
+    k = kind_of(name)
+    if k == "other":
+        return None
+    rel = os.path.relpath(path, root_dir).replace("\\", "/")
+    sub = posixpath.dirname(rel)
+    return {"name": name, "sub": sub, "kind": k, "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def lib_delete(kind, sub, name):
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    base = safe_join(d, sub)
+    p = safe_join(base, name)
+    if not os.path.isfile(p):
+        raise ValueError("文件不存在")
+    os.remove(p)
+    return True
+
+
+def lib_mkproject(kind, name):
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    name = (name or "").strip().replace("\\", "/").strip("/")
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError("子库名不合法（不能带斜杠）")
+    p = safe_join(d, name)
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def lib_delete_many(kind, items):
+    """批量删文件。items = [{"sub": "...", "name": "..."}]
+    逐个删，单个失败不影响其他；返回删掉几个、哪些没删掉、为什么。"""
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    done, failed = 0, []
+    for it in items or []:
+        try:
+            sub = (it.get("sub") or "").strip("/")
+            name = (it.get("name") or "").strip()
+            if not name:
+                raise ValueError("文件名为空")
+            p = safe_join(safe_join(d, sub), name)
+            if not os.path.isfile(p):
+                raise ValueError("文件不存在")
+            os.remove(p)
+            done += 1
+        except Exception as e:
+            failed.append({"name": it.get("name", ""), "sub": it.get("sub", ""), "error": str(e)})
+    return {"deleted": done, "failed": failed}
+
+
+def lib_delete_project(kind, name):
+    """整个子库一起删（含里面的子目录）。只允许删一级子目录，根目录永远不碰。"""
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    name = (name or "").strip().replace("\\", "/").strip("/")
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError("子库名不合法")
+    base = os.path.abspath(d)
+    p = safe_join(base, name)
+    if p == base:
+        raise ValueError("不能删根目录")
+    if not os.path.isdir(p):
+        raise ValueError("子库不存在")
+    # 先数一遍，好让界面把「要删多少」说清楚
+    files = 0
+    for _dirpath, _dirs, fs in os.walk(p):
+        files += len(fs)
+    shutil.rmtree(p)
+    return {"deleted_files": files, "path": p}
+
+
+def lib_delete_dir(kind, sub):
+    """删素材库内部的一个文件夹（含里面的文件和子目录）。
+    sub 是相对 input / output 的路径，可以是多级（图片/Qwen2.1/2026-10-08）。"""
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    sub = (sub or "").strip().replace("\\", "/").strip("/")
+    if not sub:
+        raise ValueError("没说要删哪个文件夹")
+    if any(seg in ("", ".", "..") for seg in sub.split("/")):
+        raise ValueError("路径不合法")
+    base = os.path.abspath(d)
+    p = safe_join(base, sub)
+    if p == base:
+        raise ValueError("不能删根目录")
+    if not os.path.isdir(p):
+        raise ValueError("文件夹不存在")
+    files = 0
+    for _dirpath, _dirs, fs in os.walk(p):
+        files += len(fs)
+    shutil.rmtree(p)
+    return {"deleted_files": files, "path": p}
+
+
+# ----------------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------------
+class Handler(http.server.SimpleHTTPRequestHandler):
+    """静态文件 + 素材库 API（静态文件禁缓存，改完 JS 刷新即生效）"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=ROOT, **kw)
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        code = args[1] if len(args) > 1 else ""
+        if str(code).startswith(("4", "5")):
+            sys.stderr.write("  [%s] %s\n" % (code, args[0]))
+
+    # ---------- 工具 ----------
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else b""
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+
+    def _q(self, u):
+        return {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+
+    # ---------- 路由 ----------
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/api/lib/"):
+            return self._lib_get(u)
+        return super().do_GET()
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/api/lib/"):
+            return self._lib_post(u)
+        self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/api/lib/"):
+            return self._lib_delete(u)
+        self._json({"error": "not found"}, 404)
+
+    def _lib_get(self, u):
+        q = self._q(u)
+        tail = u.path[len("/api/lib/"):]
+        try:
+            if tail == "root":
+                r = comfy_root()
+                return self._json({
+                    "ok": bool(r), "root": r,
+                    "input": os.path.join(r, "input") if r else "",
+                    "output": os.path.join(r, "output") if r else "",
+                    "candidates": [c for c in _candidates() if c],
+                })
+            if tail == "projects":
+                kind = q.get("kind", "input")
+                return self._json({"projects": lib_projects(kind), "root": comfy_root()})
+            if tail == "items":
+                kind = q.get("kind", "input")
+                project = q.get("project", "")
+                return self._json({"items": lib_items(kind, project), "project": project})
+            return self._json({"error": "unknown endpoint"}, 404)
+        except Exception as e:
+            return self._json({"error": str(e)}, 500)
+
+    def _lib_post(self, u):
+        tail = u.path[len("/api/lib/"):]
+        body = self._body()
+        try:
+            if tail == "root":
+                root = (body.get("root") or "").strip().replace("\\", "/").rstrip("/")
+                if not _is_comfy(root):
+                    return self._json({"ok": False, "error": "这个目录下没有 input / output 子目录"}, 400)
+                with open(ROOT_CFG, "w", encoding="utf-8") as f:
+                    f.write(root)
+                return self._json({"ok": True, "root": root})
+            if tail == "project":
+                kind = body.get("kind", "input")
+                p = lib_mkproject(kind, body.get("name", ""))
+                return self._json({"ok": True, "path": p})
+            if tail == "delete":                       # 批量删文件
+                kind = body.get("kind", "input")
+                return self._json({"ok": True, **lib_delete_many(kind, body.get("items") or [])})
+            return self._json({"error": "unknown endpoint"}, 404)
+        except Exception as e:
+            return self._json({"error": str(e)}, 400)
+
+    def _lib_delete(self, u):
+        q = self._q(u)
+        try:
+            if u.path.rstrip("/").endswith("/project"):   # 整个子库一起删
+                r = lib_delete_project(q.get("kind", "input"), q.get("name", ""))
+                return self._json({"ok": True, **r})
+            if u.path.rstrip("/").endswith("/dir"):      # 素材库内部的文件夹一起删
+                r = lib_delete_dir(q.get("kind", "input"), q.get("sub", ""))
+                return self._json({"ok": True, **r})
+            lib_delete(q.get("kind", "input"), q.get("sub", ""), q.get("name", ""))
+            return self._json({"ok": True})
+        except Exception as e:
+            return self._json({"error": str(e)}, 400)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def port_busy(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.4)
+        return s.connect_ex((HOST, port)) == 0
+
+
+def main():
+    url = "http://%s:%d/" % (HOST, PORT)
+
+    if port_busy(PORT):
+        print()
+        print("  端口 %d 已有服务在跑，直接打开：%s" % (PORT, url))
+        print("  （如果那是别的程序占的，改 serve.py 里的 PORT 即可）")
+        webbrowser.open(url)
+        return 0
+
+    try:
+        httpd = Server((HOST, PORT), Handler)
+    except OSError as e:
+        print()
+        print("  启动失败：%s" % e)
+        print("  端口 %d 被占用或权限不足，改 serve.py 里的 PORT 再试。" % PORT)
+        return 1
+
+    r = comfy_root()
+    print()
+    print("  ============================================")
+    print("   本地无限画布")
+    print("   地址： %s" % url)
+    print("   ComfyUI： %s" % r)
+    if not r:
+        print("   ! 没找到 ComfyUI 的 input/output，素材库会显示未就绪")
+    print("   关闭本窗口即停止服务")
+    print("  ============================================")
+    print()
+    sys.stdout.flush()
+
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  已停止。")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

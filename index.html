@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>本地无限画布 · ComfyUI</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ===== 顶栏 ===== -->
+  <header class="topbar">
+    <button id="btn-toggle-side" class="icon-btn side-toggle" title="折叠 / 展开侧栏 (Ctrl+B)">«</button>
+    <div class="brand">
+      <div class="logo">∞</div>
+      <div class="brand-text">
+        <strong>无限画布</strong>
+        <span id="conn-state" class="conn off">未连接</span>
+      </div>
+    </div>
+
+    <div class="topbar-center">
+      <input id="comfy-url" class="input url" value="http://127.0.0.1:8188" spellcheck="false" title="ComfyUI 地址">
+      <button id="btn-connect" class="btn btn-accent">连接</button>
+      <span id="gpu-info" class="gpu"></span>
+    </div>
+
+    <div class="topbar-right">
+      <button id="btn-fit" class="btn btn-ghost" title="缩放到适配 (F)">适配</button>
+      <button id="btn-day" class="btn btn-ghost" title="切换日间背景：界面和画布变浅色">☀️ 日间</button>
+      <button id="btn-bgimg" class="btn btn-ghost" title="自定义背景图片（已设置时再点一次清除）">🖼 背景</button>
+      <button id="btn-export" class="btn btn-ghost" title="导出画布 JSON">导出</button>
+      <button id="btn-import" class="btn btn-ghost" title="导入画布 JSON">导入</button>
+      <button id="btn-clear" class="btn btn-ghost danger" title="清空画布">清空</button>
+      <input id="file-import" type="file" accept=".json" hidden>
+    </div>
+  </header>
+
+  <!-- ===== 左侧：工作流库 / 素材库 ===== -->
+  <aside class="sidebar">
+    <div class="side-tabs">
+      <button class="side-tab active" data-tab="wf">工作流</button>
+      <button class="side-tab" data-tab="lib">素材库</button>
+    </div>
+
+    <div class="side-pane" id="pane-wf">
+    <div class="side-head">
+      <span>工作流库</span>
+      <button id="btn-refresh-wf" class="icon-btn" title="重新扫描">⟳</button>
+    </div>
+    <div class="side-add">
+      <div class="side-add-t">新建素材节点</div>
+      <div class="side-add-grid">
+        <button class="add-btn" data-inkind="text"><b>文</b><span>文本输入</span></button>
+        <button class="add-btn" data-inkind="image"><b>图</b><span>图像输入</span></button>
+        <button class="add-btn" data-inkind="video"><b>视</b><span>视频输入</span></button>
+        <button class="add-btn" data-inkind="audio"><b>音</b><span>音频输入</span></button>
+      </div>
+    </div>
+    <div class="side-search">
+      <input id="wf-search" class="input" placeholder="搜索工作流…" spellcheck="false">
+    </div>
+    <div class="side-filter" id="wf-filter">
+      <button class="chip active" data-kind="all">全部</button>
+      <button class="chip" data-kind="image">生图</button>
+      <button class="chip" data-kind="video">视频</button>
+      <button class="chip" data-kind="other">其他</button>
+    </div>
+    <div id="wf-list" class="wf-list">
+      <div class="hint">连接 ComfyUI 后自动加载</div>
+    </div>
+    <div class="side-foot">
+      <span id="wf-count">0 个工作流</span>
+    </div>
+    </div><!-- /pane-wf -->
+
+    <div class="side-pane hide" id="pane-lib">
+      <div class="side-head">
+        <span>素材库</span>
+        <span class="side-head-act">
+          <button id="btn-lib-upload" class="icon-btn" title="上传文件到当前子库">⤴</button>
+          <button id="btn-lib-newproj" class="icon-btn" title="新建子库（项目）">＋</button>
+          <button id="btn-lib-refresh" class="icon-btn" title="重新扫描目录">⟳</button>
+        </span>
+      </div>
+      <div class="lib-kinds" id="lib-kinds">
+        <button class="chip active" data-libkind="input">input 素材</button>
+        <button class="chip" data-libkind="output">output 结果</button>
+      </div>
+      <div class="lib-projects" id="lib-projects">
+        <div class="hint-sm">连接后加载</div>
+      </div>
+      <!-- 批量删除条：勾了素材才亮起来 -->
+      <div class="lib-selbar" id="lib-selbar">
+        <span id="lib-sel-n">已选 0</span>
+        <button id="lib-sel-all" class="mini-btn" title="把当前子库列出来的全部勾上">全选</button>
+        <button id="lib-sel-inv" class="mini-btn" title="已勾的取消、没勾的勾上">反选</button>
+        <button id="lib-sel-del" class="mini-btn stop" title="删掉勾选的素材文件">删除</button>
+        <button id="lib-sel-cancel" class="mini-btn" title="取消勾选">取消</button>
+      </div>
+      <div id="lib-items" class="lib-items">
+        <div class="hint-sm">—</div>
+      </div>
+      <div class="side-foot">
+        <span id="lib-count">素材库未就绪</span>
+      </div>
+    </div><!-- /pane-lib -->
+  </aside>
+
+  <!-- ===== 画布 ===== -->
+  <main id="stage" class="stage">
+    <!-- 自定义背景图图层：铺在画布最底，节点和线都在它上面 -->
+    <div id="bgimg" class="bgimg hide"></div>
+    <div id="world" class="world">
+      <svg id="edges" class="edges"></svg>
+      <div id="nodes" class="nodes"></div>
+    </div>
+
+    <div class="hud">
+      <button class="hud-btn" data-zoom="out" title="缩小">−</button>
+      <span id="zoom-label" class="zoom">100%</span>
+      <button class="hud-btn" data-zoom="in" title="放大">＋</button>
+      <button class="hud-btn" data-zoom="reset" title="回到 100%">⦿</button>
+    </div>
+
+    <!-- 批量操作条：空格+左键框选后浮出来 -->
+    <div id="sel-bar" class="sel-bar">
+      <span id="sel-count" class="sel-count">已选 <b>0</b> 个</span>
+      <button id="sel-copy" class="sel-btn" title="复制选中节点 (Ctrl+C)">复制</button>
+      <button id="sel-dup" class="sel-btn" title="原地再来一份 (Ctrl+D)">再来一份</button>
+      <button id="sel-del" class="sel-btn danger" title="删除选中节点 (Delete)">删除</button>
+      <button id="sel-close" class="sel-btn" title="取消选中 (Esc)">取消</button>
+      <span class="sel-hint">Shift 加选 · 拖标题栏整组移动</span>
+    </div>
+
+    <div id="empty-tip" class="empty-tip">
+      <div class="empty-icon">∞</div>
+      <p>左侧选一个工作流，或新建一个素材节点</p>
+      <p class="dim">从素材库拖素材进画布 · 从素材卡左边的虚线圈往外拖就能拉出素材节点 · 空格 + 左键框选 · 滚轮缩放</p>
+    </div>
+
+    <div id="toast-wrap" class="toast-wrap"></div>
+  </main>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
