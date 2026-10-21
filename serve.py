@@ -14,6 +14,7 @@ serve.py —— 本地无限画布的静态服务器 + 素材库 API
     GET    /api/lib/projects?kind=input    按一级子目录分「项目」
     GET    /api/lib/items?kind=input&project=xxx
     POST   /api/lib/project {kind,name}    新建子库（一级目录）
+    POST   /api/lib/rename {kind,sub,name,to}  改文件名（扩展名不动）
     DELETE /api/lib/file?kind=&sub=&name=  删文件
     POST   /api/lib/delete {kind,items:[{sub,name}]}   批量删文件
     DELETE /api/lib/project?kind=&name=    整个子库（含子目录）一起删
@@ -48,6 +49,12 @@ MEDIA_EXT = {
 
 MAX_ITEMS = 400          # 单个子库最多列这么多条（按修改时间倒序）
 COUNT_CAP = 4000         # 统计子库文件数时最多数这么多，防止超大树卡住
+
+# 改文件名时要挡掉的东西：Windows 不允许的字符 + 保留设备名
+BAD_CHARS = '<>:"/\\|?*'
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                *("COM%d" % i for i in range(1, 10)),
+                *("LPT%d" % i for i in range(1, 10))}
 
 
 # ----------------------------------------------------------------------------
@@ -204,6 +211,81 @@ def lib_delete(kind, sub, name):
     return True
 
 
+def lib_rename(kind, sub, name, to):
+    """改素材的文件名：目录不动、扩展名不动。
+
+    前端传上来的 `to` 是**不带扩展名的名字**（界面上扩展名拆成固定后缀，改不了），
+    这里仍兜一层：万一把 "abc.png" 整串送进来，别拼成 "abc.png.png"。
+    扩展名不改是有意的 —— 库里靠后缀区分图片 / 视频 / 音频，缩略图也靠它决定怎么画。
+    """
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    base = safe_join(d, sub)
+    src = safe_join(base, name)
+    if not os.path.isfile(src):
+        raise ValueError("文件不存在")
+    ext = os.path.splitext(name)[1]
+    new = (to or "").strip()
+    if ext and new.lower().endswith(ext.lower()):
+        new = new[:-len(ext)]
+    new = new.strip()
+    if not new or new in (".", ".."):
+        raise ValueError("新名字不能为空")
+    if any(ch in BAD_CHARS for ch in new) or any(ord(ch) < 32 for ch in new):
+        raise ValueError('新名字不能带 \\ / : * ? " < > | 这些字符')
+    if new[-1] in ". ":
+        raise ValueError("新名字不能以点或空格结尾")
+    if new.split(".")[0].upper() in WIN_RESERVED:
+        raise ValueError("「%s」是 Windows 的保留名，换一个" % new)
+    dst = safe_join(base, new + ext)
+    if dst.lower() == src.lower():                 # 只改了大小写，仍要真的改
+        if dst != src:
+            tmp = safe_join(base, "_wy_rename_tmp_" + name)
+            os.rename(src, tmp)
+            os.rename(tmp, dst)
+            return {"ok": True, "name": new + ext, "from": name}
+        return {"ok": True, "name": name, "unchanged": True}
+    if os.path.exists(dst):
+        raise ValueError("这个子库里已经有叫「%s」的文件了" % (new + ext))
+    os.rename(src, dst)
+    return {"ok": True, "name": new + ext, "from": name}
+
+
+def probe_video(kind, sub, name):
+    """读视频的帧数 / 帧率 / 宽高。
+
+    导演台的分段模式切到 v2v（视频转视频）时，时间线里必须写死源视频的长度，
+    填错了 ComfyUI 会去读超出片尾的帧。浏览器拿不到帧数（只能拿到时长），
+    所以这一格必须由后端用 OpenCV 探一次。
+    """
+    d = kind_dir(kind)
+    if not d:
+        raise ValueError("没找到 ComfyUI 目录")
+    p = safe_join(safe_join(d, sub), name)
+    if not os.path.isfile(p):
+        raise ValueError("文件不存在")
+    try:
+        import cv2
+    except Exception:
+        raise ValueError("这台机器的 python 没装 opencv，探不了时长；请在导演台的时间线面板里直接选视频")
+    cap = cv2.VideoCapture(p)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError("这个文件解不开（不是视频 / 编码不支持）")
+    try:
+        frames = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        w = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0))
+        h = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0))
+    finally:
+        cap.release()
+    if frames <= 0:
+        raise ValueError("这个视频读不出帧数（可能是可变帧率），请在导演台面板里直接选")
+    return {"ok": True, "frames": frames, "fps": round(fps or 24, 3),
+            "width": w, "height": h, "path": p}
+
+
 def lib_mkproject(kind, name):
     d = kind_dir(kind)
     if not d:
@@ -341,13 +423,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ---------- 工具 ----------
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
         try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # 浏览器已经把页面关了 / 跳走了还回来取结果，别在控制台糊一段 traceback
             pass
 
     def _body(self):
@@ -399,6 +482,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 kind = q.get("kind", "input")
                 project = q.get("project", "")
                 return self._json({"items": lib_items(kind, project), "project": project})
+            if tail == "probe":                      # 视频帧数 / 帧率 / 宽高
+                return self._json(probe_video(q.get("kind", "input"),
+                                              q.get("sub", ""), q.get("name", "")))
             return self._json({"error": "unknown endpoint"}, 404)
         except Exception as e:
             return self._json({"error": str(e)}, 500)
@@ -421,6 +507,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if tail == "delete":                       # 批量删文件
                 kind = body.get("kind", "input")
                 return self._json({"ok": True, **lib_delete_many(kind, body.get("items") or [])})
+            if tail == "rename":                       # 改文件名（扩展名不动）
+                return self._json({"ok": True, **lib_rename(
+                    body.get("kind", "input"), body.get("sub", ""),
+                    body.get("name", ""), body.get("to", ""))})
             if tail == "collect":                      # 收进成品库（复制，不删源）
                 return self._json({"ok": True, **lib_collect(
                     body.get("kind", "output"), body.get("sub", ""),

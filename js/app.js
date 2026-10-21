@@ -60,7 +60,11 @@ function toast(msg, type = "", ms = 3200) {
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-function isVideoName(n) { return /视频|video|数字人|对口型|动作迁移|跳舞|短剧|ltx|wan|hunyuan|animate|svd/i.test(n || ""); }
+/* 工作流归「生图 / 视频」只看名字：h3 那套（文生视频 / 双采样 / 导演台 / 动作迁移）
+   清一色是跑视频的，名字里不一定带「视频」，所以模型名也算进去 */
+function isVideoName(n) {
+  return /视频|video|数字人|对口型|动作迁移|跳舞|短剧|ltx|wan|hunyuan|animate|svd|h3|minimax/i.test(n || "");
+}
 
 /* ==================================================================
    启动
@@ -356,7 +360,8 @@ function bindUI() {
     const fits = (x) => otype === "media" || x.dataset.itype === otype || x.dataset.itype === "media";
     const okIns = ins.filter(fits);
     ins.forEach(x => x.classList.add(fits(x) ? "connectable" : "dim"));
-    /* 没有匹配的口不拦着：精确类型拖到空白处就能落一个新素材节点；
+    /* 没有匹配的口不拦着：精确类型拖到空白处会列出「能吃这种素材」的工作流
+       （一个都没有才退回「落一个素材节点」）；
        只有「类型判不了（media）」时才提示，那种拖空白也建不了 */
     if (!okIns.length && otype === "media") toast("画布上没有能接产出的输入口；这个工作流产出的类型判不了，请连到具体素材节点", "", 3200);
     document.body.style.cursor = "crosshair";
@@ -375,22 +380,21 @@ function bindUI() {
       ins.forEach(x => x.classList.remove("connectable", "dim", "port-drop"));
       const target = document.elementFromPoint(ev.clientX, ev.clientY)?.closest('.port[data-kind="in"]');
       if (!target) {
-        /* 空白处松手 → 在松手的位置落一个接得住这个产出的素材节点，自动连上
-           （和「从输入口往外拉、空白处建素材节点」完全对称） */
+        /* 只是点了一下（没拖动）：别凭空造出一个节点来 */
         if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 6) { view.scheduleEdges(); return; }
         if (otype === "media") {
           toast("这个工作流的产出类型判不了，把线拖到具体的素材节点上", "");
           view.scheduleEdges();
           return;
         }
+        /* 空白处松手 → 不再塞一个「素材接素材」的空节点，
+           而是列出「能吃这种素材」的工作流让人挑，挑中就把素材接到它的空槽上 */
+        view.setEdges(S.edges);            // 先把拖拽的临时线擦掉，再弹清单
         const w = view.screenToWorld(ev.clientX, ev.clientY);
-        const n = addInputNode(otype, { x: w.x - 60, y: w.y - 30 });
-        if (!n) { view.scheduleEdges(); return; }
-        S.edges.push({ from: fromId, to: n.id, key: null, type: otype });
-        view.setEdges(S.edges);
-        renderNode(n);
-        save();
-        toast(`已建「${n.name}」并连上：跑完「${nodeName(fromId)}」的产出会显示在这个节点里`, "ok");
+        openWfPicker({
+          kind: otype, fromId, at: { x: w.x, y: w.y }, sx: ev.clientX, sy: ev.clientY,
+          fallback: () => pullIntoInputNode(fromId, otype, w),
+        });
         return;
       }
       if (!fits(target)) {
@@ -468,6 +472,7 @@ async function loadWorkflows(manual = false) {
       name: f.replace(/\.json$/i, ""),
       kind: isVideoName(f) ? "video" : "image",
     }));
+    resetWfIntake();               // 工作流列表变了：重扫「谁能接什么」
     $("#wf-count").textContent = `${S.workflows.length} 个工作流`;
     renderWorkflowList();
     if (manual) toast(`已扫描到 ${S.workflows.length} 个工作流`, "ok");
@@ -725,7 +730,7 @@ async function pushModesToComfy(node, { quiet = false } = {}) {
     changed++;
   }
   if (!changed) {
-    if (!quiet) toast(notInFile ? "这个素材是画布补出来的，工作流文件里没有它，没什么可同步" : "ComfyUI 那边已经是这个状态了", "");
+    if (!quiet) toast(notInFile ? "这个节点是画布补出来的，工作流文件里没有它，没什么可同步" : "ComfyUI 那边已经是这个状态了", "");
     return { changed: 0, notInFile, why: "已一致" };
   }
   try {
@@ -790,17 +795,58 @@ function buildFields(node) {
     const info = S.oi?.[nd.class_type];
     if (!info) continue;
     const locks = lockMapOf(nd.class_type, effInputs(node, nodeId, nd));
-    for (const w of listWidgets(info)) {
+    const title = nd._meta?.title || nd.class_type;
+    const inlined = nd._meta?.inlined || {};
+    /* object_info 里声明过的输入名；widget 名单独留一份 —— autogrow 容器（values / ref_images）
+       本身是声明过的，但它底下的 values.a 才是真正能改的那个数 */
+    const widgets = listWidgets(info);
+    const widgetNames = new Set(widgets.map(w => w.name));
+    const declared = new Set([...Object.keys(info.input?.required || {}), ...Object.keys(info.input?.optional || {})]);
+    for (const w of widgets) {
       const v = nd.inputs?.[w.name];
-      if (v === undefined || Array.isArray(v)) continue;
-      out.push({
+      if (v === undefined) continue;
+      const f = {
         key: nodeId + "|" + w.name,
         nodeId, name: w.name, type: w.type,
         choices: w.choices, value: v,
-        title: nd._meta?.title || nd.class_type,
-        cls: nd.class_type,
+        title, cls: nd.class_type,
         min: w.min, max: w.max, step: w.step,
         locked: locks[w.name] || "",
+      };
+      if (Array.isArray(v)) {
+        /* 这一格被上游连线驱动（时长就是典型：length 由表达式节点算出，
+           常数写在 PrimitiveFloat 里）。这类口必须露出来 —— 藏掉它，
+           面板上看着就像「这个工作流根本没有时长设置」 */
+        if (!RE_DURATION.test(semName(f))) continue;
+        f.driven = String(v[0]);
+        f.value = null;
+        out.push(f);
+        continue;
+      }
+      out.push(f);
+    }
+
+    /* 声明之外的实值口：autogrow 变量（ComfyMathExpression 的 a）、
+       被内联进来的常量（时长 10.1 就藏在这儿，源节点标题是 Float (duration)）。
+       以前这些口一律被丢掉，于是「时长设置」在面板上凭空消失 */
+    for (const [k, v] of Object.entries(nd.inputs || {})) {
+      if (!k || k.startsWith("_")) continue;
+      if (declared.has(k)) continue;
+      const parent = k.includes(".") ? k.split(".")[0] : "";
+      if (parent && widgetNames.has(parent)) continue;   // 动态下拉的子格，主格已经管着它
+      if (Array.isArray(v) || (v !== null && typeof v === "object")) continue;
+      if (v === "" || v === null || v === undefined) continue;
+      const t = inlined[k] || title;
+      /* 数学节点的 a / b 操作数：标题里认不出含义的，摆出来只会误导 */
+      if (/^[a-z]$/i.test(k) && semName({ name: k, title: t, fromPrim: !!inlined[k] }) === k) continue;
+      out.push({
+        key: nodeId + "|" + k, nodeId, name: k,
+        type: typeof v === "number" ? (Number.isInteger(v) ? "INT" : "FLOAT")
+          : typeof v === "boolean" ? "BOOLEAN" : "STRING",
+        choices: null, value: v,
+        title: t, cls: nd.class_type,
+        locked: locks[k] || "",
+        fromPrim: !!inlined[k],
       });
     }
   }
@@ -812,6 +858,37 @@ const RE_SIZE = /(width|height|size|length|duration|frame|megapixel|resolution)/
 const RE_SAMPLE = /(seed|steps|cfg|sampler|scheduler|denoise|strength|guidance|shift)/i;
 /* 模型 / 权重类下拉：这些是「本机装了没装」的问题，跟素材分开摆 */
 const RE_MODEL = /(ckpt|checkpoint|lora|vae|clip_name|clip_vision|unet|control_net|gligen|upscale_model|style_model|model_name|^model$|_model$|ipadapter|embedding|hypernetwork|gguf)/i;
+/* 收进「更多参数」的：批量张数、重绘幅度 —— 这两个不常改，摆在前排白占地方 */
+const RE_MORE = /^(batch_size|batch_count|denoise|denoise_strength)$/i;
+/* 提到最前面的：画幅比例、时长（含帧数这类「这条要跑多久」的口）。
+   这两格一改，宽度高度、帧数、步数都得跟着重调，埋在尺寸堆里找不到 */
+const RE_ASPECT = /^(aspect_ratio|aspect|ratio|image_aspect|aspect_policy)$/i;
+const RE_DURATION = /^(duration|video_duration|duration_seconds|seconds|length|num_frames|total_frames|video_length)$/i;
+/* 模式切换（导演台的「分段模式」t2v / i2v / v2v / r2v…）：这一格决定整条流吃哪种素材，
+   接视频时画布还会自动把它切到 v2v —— 埋在参数堆里等于让人自己去猜 */
+const RE_MODE = /^(task_type|segment_mode|分段模式|task_mode|edit_mode|work_mode)$/i;
+
+/* 泛名 widget：PrimitiveFloat / PrimitiveInt / 常量节点上的参数就叫 value / int，
+   真正的含义只写在节点标题里（Float (duration)）。名字取不出来就只剩一个 value，
+   面板上等于没写，好端端的时长参数被埋进「更多参数」里找不着 */
+const GENERIC_W = /^(value|val|int|float|number|num|string|text_value)$/i;
+const TITLE_SEM = [
+  [/duration|seconds?|\bsec\b|时长|秒/i, "duration"],
+  [/frames?|帧数/i, "num_frames"],
+  [/batch|张数|数量/i, "batch_size"],
+  [/seed|种子/i, "seed"],
+  [/steps?|步数/i, "steps"],
+];
+/** 参数在这个面板上「叫什么」：泛名 widget 用节点标题里的词顶上，其余用原名 */
+function semName(f) {
+  const n = String(f?.name ?? "");
+  /* 单字母（ComfyMathExpression 的 a / b）和内联常量也靠标题认：
+     它们的名字本来就没有含义，含义只写在原节点标题里 */
+  if (!GENERIC_W.test(n) && !/^[a-z]$/i.test(n) && !f?.fromPrim) return n;
+  const t = String(f?.title || "");
+  for (const [re, name] of TITLE_SEM) if (re.test(t)) return name;
+  return n;
+}
 
 /* ==================================================================
    参数名 → 中文
@@ -885,7 +962,7 @@ const PARAM_CN = {
   dino_batch: "DINO 批次", color_alignment: "色彩对齐", vae_tile_size: "VAE 分块尺寸",
   vae_tile_overlap: "VAE 分块重叠", blocks_to_swap: "换出块数", sage_preset: "Sage 预设",
   /* H3 / 导演台 */
-  task_type: "任务类型", audio_mode: "音频模式", audio_denoise_strength: "音频重绘幅度",
+  task_type: "分段模式", audio_mode: "音频模式", audio_denoise_strength: "音频重绘幅度",
   reference_video_policy: "参考视频策略", strict_prompt_tags: "严格提示词标签",
   add_source_as_reference: "把源加入参考", prompt_primary_audio_ordinal: "主音频序号",
   allow_above_reference_area: "允许超出参考区", auto_length_from_audio: "按音频自动定时长",
@@ -972,7 +1049,8 @@ const PARAM_CN_LOWER = new Map(Object.entries(PARAM_CN).map(([k, v]) => [k.toLow
 
 /** 参数名 → 中文（认不出来就原样返回英文） */
 function cnName(f) {
-  const raw = String(f?.name ?? "");
+  /* 泛名 widget 先按节点标题换成有含义的名字（value + 「Float (duration)」→ duration） */
+  const raw = String(semName(f) ?? "");
   const key = raw.toLowerCase();
   if (PARAM_CN_LOWER.has(key)) return PARAM_CN_LOWER.get(key);
   /* 中文 widget 名（部分插件自己就是中文）直接用 */
@@ -1035,7 +1113,6 @@ const HIDDEN_WIDGETS = {
     width: "由时间线面板按画幅算出",
     height: "由时间线面板按画幅算出",
     ref_max_size: "由时间线面板接管",
-    task_type: "由时间线面板接管",
     global_prompt: "由时间线面板接管",
     frame_rate: "由时间线面板接管",
     cfg: "由时间线面板接管",
@@ -1063,8 +1140,8 @@ const HIDDEN_WIDGETS = {
 const DIRECTOR_PANEL_HIDDEN = {
   timeline_data: "由时间线面板接管", total_frames: "由时间线面板接管",
   width: "由时间线面板按画幅算出", height: "由时间线面板按画幅算出",
-  ref_max_size: "由时间线面板接管", task_type: "由时间线面板接管",
-  global_prompt: "由时间线面板接管", frame_rate: "由时间线面板接管",
+  ref_max_size: "由时间线面板接管", global_prompt: "由时间线面板接管",
+  frame_rate: "由时间线面板接管",
   cfg: "由时间线面板接管", export_source_images: "由时间线面板接管",
   export_pre_face_refine: "由时间线面板接管",
 };
@@ -1109,8 +1186,14 @@ function classify(f) {
   const tt = targetType(f);
   if (tt === "text") return "main";
   if (tt) return "asset";
-  if (RE_SIZE.test(f.name)) return "size";
-  if (RE_SAMPLE.test(f.name)) return "sample";
+  /* 泛名 widget 按节点标题认（Float (duration) 的 value → duration） */
+  const sn = semName(f);
+  if (RE_MORE.test(sn)) return "other";
+  if (RE_MODE.test(sn)) return "mode";
+  if (RE_ASPECT.test(sn)) return "front";
+  if (RE_DURATION.test(sn)) return f.driven ? "other" : "when";
+  if (RE_SIZE.test(sn)) return "size";
+  if (RE_SAMPLE.test(sn)) return "sample";
   if (f.type === "COMBO" && RE_MODEL.test(f.name)) return "model";
   return "other";
 }
@@ -1323,7 +1406,7 @@ function lockedBox(list, node) {
   return d;
 }
 
-function fieldControl(f, node) {
+function fieldControl(f, node, opt) {
   const cur = node.params[f.key] !== undefined ? node.params[f.key] : f.value;
   const cls = classify(f);
   const miss = missOf(f, cur);
@@ -1340,13 +1423,31 @@ function fieldControl(f, node) {
   const pcn = PASS_CN[f._pass] || "";
   const cnBody = pcn && cn.startsWith(pcn) ? cn.slice(pcn.length).trim() || cn : cn;
   const tag = f._pass ? `<em class="pass-mini">${pcn}</em>` : "";
+  /* 右边要挂节点角标时就不摆英文原名了 —— 一行里塞三个东西谁也看不清，
+     何况角标里本来就是节点的英文类名 */
+  const hasNodeTag = !!(opt && opt.tag);
   label.innerHTML = `<span class="lbl-cn">${tag}${esc(cnBody)}</span>`
-    + (cnBody !== f.name ? `<span class="lbl-en">${esc(f.name)}</span>` : "");
+    + (!hasNodeTag && cnBody !== f.name ? `<span class="lbl-en">${esc(f.fromPrim ? f.title : f.name)}</span>` : "");
 
   const head = document.createElement("div");
   head.className = "field-head";
   head.appendChild(label);
+  /* 单字段节点不再单独占一个小标题行 —— 名字缩成角标挂在标签右边，
+     几个这种节点就能并排一行，底下不会留半格空白 */
+  if (opt && opt.tag) {
+    const t = document.createElement("em");
+    t.className = "node-tag";
+    t.textContent = opt.tag;
+    t.title = "这一格属于「" + opt.tag + "」节点";
+    head.appendChild(t);
+  }
   wrap.appendChild(head);
+  if (f._durHint) {
+    const h = document.createElement("div");
+    h.className = "hint-tip";
+    h.textContent = "帧数由这一格自动换算";
+    wrap.appendChild(h);
+  }
   const tt = targetType(f);
   if (tt) {
     const p = document.createElement("span");
@@ -1356,6 +1457,16 @@ function fieldControl(f, node) {
     p.dataset.itype = tt;
     p.title = `把「${IN_KINDS[tt].label}」节点的输出线拖到这里`;
     wrap.appendChild(p);
+  }
+
+  /* 这一格由上游算出（时长等）：不给输入框，只说明「谁在给它」，改要改上游那一格 */
+  if (f.driven) {
+    const w = document.createElement("div");
+    w.className = "wired";
+    w.title = "这一格是上游算出来的，跟着上游变 · 改上游那一格即可";
+    w.innerHTML = `<span class="wired-dot"></span><span class="wired-t">由「${esc(nodeLabel(node, f.driven))}」算出</span>`;
+    wrap.appendChild(w);
+    return wrap;
   }
 
   /* 这个输入已经接了线：不显示下拉，只显示「来自谁」 */
@@ -1395,7 +1506,10 @@ function fieldControl(f, node) {
     }
     for (const o of opts) {
       const op = document.createElement("option");
-      op.value = o; op.textContent = o;
+      op.value = o;
+      /* 模式类下拉的选项带英文括注（v2v — 视频转视频(Video to Video)），
+         一排两格里塞不下，显示时去掉括注，值仍然是完整的那个字符串 */
+      op.textContent = RE_MODE.test(f.name) ? String(o).replace(/\s*\([^)]*\)\s*/g, "").trim() : o;
       if (o === cur) op.selected = true;
       sel.appendChild(op);
     }
@@ -1814,6 +1928,139 @@ function setAssetOff(node, loaderId, off) {
   });
 }
 
+/* ---------------- LoRA 启停 ---------------- */
+/** 某个输入口在 object_info 里声明的类型（MODEL / CLIP / IMAGE …） */
+function inputTypeOf(cls, name) {
+  const info = S.oi?.[cls];
+  const spec = info?.input?.required?.[name] || info?.input?.optional?.[name];
+  if (!Array.isArray(spec)) return "";
+  return Array.isArray(spec[0]) ? "COMBO" : String(spec[0] || "");
+}
+
+/** 停用的 LoRA 从提交副本里摘掉，下游接回它上游（只动 LoraLoader，素材另有一套） */
+function bypassLoraInPrompt(prompt, offIds) {
+  const off = new Set((offIds || []).map(String));
+  if (!off.size) return 0;
+  const target = Object.keys(prompt || {})
+    .filter(id => off.has(id) && /lora/i.test(String(prompt[id]?.class_type || "")));
+  if (!target.length) return 0;
+
+  /* 按「输出槽类型」找本节点的同类输入：LoraLoader 的 MODEL / CLIP 是两路，接错就变味 */
+  const upstreamFor = (id, slot) => {
+    const nd = prompt[id];
+    if (!nd) return null;
+    const outs = S.oi?.[nd.class_type]?.output || [];
+    const want = String(outs[Number(slot)] || "");
+    const ups = Object.entries(nd.inputs || {}).filter(([, v]) => Array.isArray(v));
+    const typed = want ? ups.find(([k]) => inputTypeOf(nd.class_type, k) === want) : null;
+    const pick = typed || (ups.length === 1 ? ups[0] : null);
+    return pick ? [String(pick[1][0]), pick[1][1]] : null;
+  };
+  const resolve = (src, slot, guard = 0) => {
+    if (guard > 32) return null;
+    if (!off.has(String(src)) || !prompt[src]) return [String(src), slot];
+    const up = upstreamFor(String(src), slot);
+    return up ? resolve(up[0], up[1], guard + 1) : null;
+  };
+
+  let n = 0;
+  /* 先替换引用，再删节点：递归里还要读它自己的输入 */
+  for (const nd of Object.values(prompt)) {
+    if (!nd?.inputs) continue;
+    for (const [k, v] of Object.entries(nd.inputs)) {
+      if (!Array.isArray(v)) continue;
+      const r = resolve(String(v[0]), v[1]);
+      if (!r || (String(r[0]) === String(v[0]) && r[1] === v[1])) continue;
+      nd.inputs[k] = r;
+      n++;
+    }
+  }
+  for (const id of target) delete prompt[id];
+  return n;
+}
+
+/** UI 工作流里一条 link 的上游，落到 prompt 里真实存在的那个节点（沿旁路链往上找） */
+function promptSourceOf(node, linkId, guard = 0) {
+  if (guard > 32) return null;
+  const links = node.uiWf?.links || [];
+  const lk = links.find(l => Array.isArray(l) && l[0] === linkId);
+  if (!lk) return null;
+  const srcId = String(lk[1]), slot = lk[2];
+  if (node.prompt?.[srcId]) return [srcId, slot];
+  /* 上游被旁路 / 静音：convert 时被穿透了，接着往上找同类型的口 */
+  const src = (node.uiWf?.nodes || []).find(n => String(n.id) === srcId);
+  if (!src) return null;
+  const ups = (src.inputs || []).filter(s => s.link != null);
+  const outType = src.outputs?.[slot]?.type;
+  const pick = ups.find(s => !outType || s.type === outType) || ups[0];
+  return pick ? promptSourceOf(node, pick.link, guard + 1) : null;
+}
+
+/**
+ * 把 ComfyUI 里被旁路的 LoRA 救回 prompt。
+ * 光把它加回来不够 —— convert 时它被旁路，下游早就穿透到它上游去了，
+ * 所以还要照着 uiWf 的连线把下游重新挂到它身上，否则新加的这个是孤儿，白加。
+ */
+function reviveLora(node, wfNode) {
+  const cls = wfNode?.type;
+  const li = cls ? S.oi?.[cls] : null;
+  if (!cls || !li || !node.prompt) return false;
+  const id = String(wfNode.id);
+  const inputs = {};
+  for (const w of listWidgets(li)) {
+    const val = uiWidgetValue(wfNode, li, w.name);
+    if (val !== undefined) inputs[w.name] = val;
+  }
+  for (const slot of wfNode.inputs || []) {
+    if (slot?.link == null || !slot.name) continue;
+    const src = promptSourceOf(node, slot.link);
+    if (src) inputs[slot.name] = src;
+  }
+  node.prompt[id] = { class_type: cls, inputs, _meta: { title: wfNode.title || cls } };
+
+  /* 下游挂回来：uiWf 里从这一节点出发的每条线，把目标口指回它 */
+  let wired = 0;
+  for (const lk of (node.uiWf?.links || [])) {
+    if (!Array.isArray(lk) || String(lk[1]) !== id) continue;
+    const toId = String(lk[3]);
+    const to = (node.uiWf.nodes || []).find(n => String(n.id) === toId);
+    const nm = to?.inputs?.[lk[4]]?.name;
+    if (!nm || !node.prompt[toId]?.inputs) continue;
+    node.prompt[toId].inputs[nm] = [id, lk[2]];
+    wired++;
+  }
+  return { restored: true, wired };
+}
+
+/** 停用 / 启用一个 LoRA：提交时旁路它，并把 ComfyUI 里那份工作流同步成同样的状态 */
+function setLoraOff(node, loraId, off) {
+  const id = String(loraId || "");
+  if (!id) return;
+  if (off) {
+    node.assetOff = [...new Set([...(node.assetOff || []), id])];
+    node.assetOn = (node.assetOn || []).filter(x => x !== id);
+  } else {
+    node.assetOff = (node.assetOff || []).filter(x => x !== id);
+    node.assetOn = [...new Set([...(node.assetOn || []), id])];
+    /* 这个 LoRA 在 prompt 里压根没有（工作流里本来就是旁路）→ 现建一条回来 */
+    if (!node.prompt?.[id]) {
+      const ui = (node.uiWf?.nodes || []).find(n => String(n.id) === id);
+      if (ui) reviveLora(node, ui);
+    }
+  }
+  renderNode(node);
+  save();
+
+  const base = off ? "已停用：这次生成不加载这个 LoRA" : "已启用：这个 LoRA 重新参与生成";
+  if (!syncCfg.push) { toast(base, off ? "" : "ok"); return; }
+  pushModesToComfy(node, { quiet: true }).then(r => {
+    if (r.error) return;
+    if (r.changed) toast(`${base} · 已写回 ComfyUI（${r.changed} 个节点）`, off ? "" : "ok", 4000);
+    else if (r.notInFile) toast(`${base} · 这是画布补出来的节点，ComfyUI 文件里没有它`, "", 4200);
+    else toast(`${base} · ComfyUI 那边已是一致状态`, off ? "" : "ok");
+  });
+}
+
 /* ---------------- 节点 DOM ---------------- */
 /**
  * 这个字段能不能接上游的东西，能接的话要哪种。
@@ -2164,6 +2411,9 @@ function renderInputBody(node, el) {
       pv.appendChild(a);
     }
     body.appendChild(pv);
+    takeDropOn(pv,
+      (item) => useLibOnInputNode(node, item),
+      (file) => uploadToNode(node, file));
 
     const nm = document.createElement("div");
     nm.className = "in-name";
@@ -2206,6 +2456,9 @@ function renderInputBody(node, el) {
       pv.appendChild(a);
     }
     body.appendChild(pv);
+    takeDropOn(pv,
+      (item) => useLibOnInputNode(node, item),
+      (file) => uploadToNode(node, file));
 
     const nm = document.createElement("div");
     nm.className = "in-name";
@@ -2235,14 +2488,10 @@ function renderInputBody(node, el) {
   drop.className = "in-drop";
   drop.innerHTML = `<b>＋</b>点击选${k.label.replace("输入", "")}，或直接拖进来`;
   drop.onclick = () => pickFile(node);
-  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
-  drop.ondragleave = () => drop.classList.remove("over");
-  drop.ondrop = (e) => {
-    e.preventDefault(); e.stopPropagation();
-    drop.classList.remove("over");
-    const f = e.dataTransfer?.files?.[0];
-    if (f) uploadToNode(node, f);
-  };
+  /* 本地文件、素材库里的条目都能直接落进来 */
+  takeDropOn(drop,
+    (item) => useLibOnInputNode(node, item),
+    (file) => uploadToNode(node, file));
   body.appendChild(drop);
 }
 
@@ -2350,7 +2599,7 @@ function renderNode(node) {
     /* 画布不提供编辑的（ComfyUI 里被节点面板接管、或由画幅算出来的宽高）单独收一堆，
        混在参数里会让人以为改了能生效，实际上节点压根不认这一格 */
     const locked = fields.filter(f => f.locked);
-    const g = { main: [], size: [], sample: [], model: [], lora: [], asset: [], other: [] };
+    const g = { main: [], mode: [], front: [], when: [], size: [], sample: [], model: [], lora: [], asset: [], other: [] };
     for (const f of fields) if (!f.locked) g[classify(f)].push(f);
 
     /* 每个字段归到哪一道（一采 / 二采 / 共用）：双采样工作流里「步数」「种子」
@@ -2369,7 +2618,10 @@ function renderNode(node) {
       .filter(s => s.loader && node.prompt[s.loader.id])
       .map(s => s.loader.id + "|" + s.loader.field));
     const plainAsset = g.asset.filter(f => !claimed.has(f.key));
-    if (slots.has || plainAsset.length) {
+    /* 导演台的源视频是连进来的（写进时间线，不是普通的字段），单独给他一行「来自谁」 */
+    const dirVid = S.edges.find(e => e.to === node.id
+      && String(e.key || "").endsWith("|" + DIRECTOR_VIDEO_KEY));
+    if (slots.has || plainAsset.length || dirVid) {
       const miss = plainAsset.filter(f => missOf(f, node.params[f.key] ?? f.value));
       let right = plainAsset.length;
       if (slots.has) {
@@ -2377,87 +2629,175 @@ function renderNode(node) {
           .map(k => `${KIND_CN[k]} ${slots.slots.filter(s => s.kind === k && !slotBlank(s.value)).length}/${slots.limits[k]}`)
           .filter(t => !/ 0\/0$/.test(t))
           .join(" · ") || plainAsset.length;
+      } else if (dirVid) {
+        right = "源视频 ← 上游";
       }
       const box = sectionBox(++secNo, "素材", miss.length ? `⚠ 缺 ${miss.length}` : right, miss.length > 0);
       const sb = box.querySelector(".sec-body");
+      if (dirVid) {
+        const row = document.createElement("div");
+        row.className = "wired-row";
+        row.appendChild(wiredChip(node, dirVid.key, { from: dirVid.from }));
+        sb.appendChild(row);
+      }
       if (slots.has) sb.appendChild(slotZone(node, slots));
-      for (const f of plainAsset) sb.appendChild(assetCard(f, node));
+      /* 固定口（首帧 / 尾帧 / 遮罩这类不是 autogrow 槽的图）也走同一套方块卡：
+         图框在上、按钮在下、同类型横排 —— 跟参考图那一片长得一样，不再是一整行 */
+      if (plainAsset.length) {
+        /* 跟槽位挨着摆的时候，上面得有一行小标题，否则会被当成上一类的格子 */
+        if (slots.has) {
+          const h = document.createElement("div");
+          h.className = "slot-head";
+          h.innerHTML = `<span>其他素材</span><span class="slot-cnt">${plainAsset.length}</span>`;
+          sb.appendChild(h);
+        }
+        const grid = document.createElement("div");
+        grid.className = "slot-grid";
+        const seen = new Map();
+        for (const f of plainAsset) {
+          let lb = nodeLabel(node, f.nodeId);
+          const n = (seen.get(lb) || 0) + 1;
+          seen.set(lb, n);
+          if (n > 1) lb += ` ${n}`;      // 好几个都叫 LoadImage 时，靠序号分开
+          grid.appendChild(assetCard(f, node, { tile: true, label: lb }));
+        }
+        sb.appendChild(grid);
+      }
       body.appendChild(box);
     }
 
     /* ② 参数设置：提示词 + 尺寸 + 采样（按道次分堆）+ 其余参数 */
-    const params = [...g.main, ...g.size, ...g.sample, ...g.other];
+    const params = [...g.main, ...g.mode, ...g.front, ...g.when, ...g.size, ...g.sample, ...g.other];
     if (params.length) {
       const box = sectionBox(++secNo, "参数设置", params.length, false);
       const sb = box.querySelector(".sec-body");
       for (const f of g.main) sb.appendChild(fieldControl(f, node));
 
-      if (g.size.length || g.sample.length) {
-        /* 按 道次 → 节点 归堆：
-           · 双采样工作流里「步数 / 种子 / 宽度」两套各有一份，先分道次；
-           · 同一道里还有好几个节点都叫「宽度 / 视频偏移」（导演台 + 偏移调节），
-             所以再把每个节点的参数聚成一小堆，并在上面写清是谁的参数。 */
-        const byStage = new Map();
-        for (const f of [...g.size, ...g.sample]) {
-          const st = stageOf(f);
-          if (!byStage.has(st)) byStage.set(st, new Map());
-          const m = byStage.get(st);
-          if (!m.has(f.nodeId)) m.set(f.nodeId, []);
-          m.get(f.nodeId).push(f);
-        }
-        /* 只有一道采样时，「共用 / 一采」这种标签纯属添乱 —— 全部并回一堆 */
-        const realStages = new Set([...byStage.keys()].filter(s => s > 0));
-        if (realStages.size <= 1) {
-          const merged = new Map();
-          for (const owners of byStage.values()) {
-            for (const [nid, fs] of owners) {
-              if (!merged.has(nid)) merged.set(nid, []);
-              merged.get(nid).push(...fs);
-            }
-          }
-          byStage.clear();
-          byStage.set(0, merged);
-        }
-        const list = [...byStage.entries()].sort((a, b) => a[0] - b[0]);
-        const split = list.length > 1;
-        /* 只有真的重名（导演台的「宽度」和精修的「宽度」）才标节点名，
-           不重名就老老实实两列摆开，别加没用的行 */
-        const seenLabel = new Map();
-        for (const f of [...g.size, ...g.sample]) {
-          const n = cnName(f);
-          seenLabel.set(n, (seenLabel.get(n) || 0) + 1);
-        }
-        const ambiguous = [...seenLabel.values()].some(v => v > 1);
-        const multiNode = ambiguous && list.reduce((n, [, m]) => n + m.size, 0) > 1;
-        const capSeen = new Map();
-        for (const [st, owners] of list) {
-          if (split) for (const fs of owners.values()) for (const f of fs) f._pass = st;
-          const blk = document.createElement("div");
-          blk.className = "pass-blk p" + st;
-          if (split) {
-            const h = document.createElement("div");
-            h.className = "pass-head";
-            h.innerHTML = `<span class="pass-tag">${PASS_CN[st] || st + " 采"}</span>`
-              + `<span class="pass-n">${[...owners.values()].reduce((n, fs) => n + fs.length, 0)} 项</span>`;
-            blk.appendChild(h);
-          }
+      /* 画幅比例、分段模式、时长单独摆一排，紧跟提示词：
+         这三格是「先定框架」的参数 —— 模式决定吃哪种素材，画幅和时长决定宽高、帧数、步数 */
+      const rank = (f) => { const n = semName(f);
+        return /^aspect_ratio$/i.test(n) ? 0 : RE_ASPECT.test(n) ? 1
+          : RE_MODE.test(n) ? 2 : 3; };
+      const lead = [...g.front, ...g.mode, ...g.when].sort((a, b) => rank(a) - rank(b));
+      /* 时长是被下游算出来的（h3：length = 表达式(时长)）—— 在时长格里点一句，
+         免得人以为改了这一格帧数没动 */
+      const durDriven = [...g.when, ...g.size, ...g.other, ...g.main]
+        .some(x => x.driven && RE_DURATION.test(semName(x)));
+      for (const f of lead) f._durHint = durDriven && !f.driven && RE_DURATION.test(semName(f));
+      /* 先把尺寸/采样按「道次 → 节点」归堆（只算结构、先不碰 DOM）：
+         · 双采样工作流里「步数 / 种子 / 宽度」两套各有一份，先分道次；
+         · 同一道里还有好几个节点都叫「宽度 / 视频偏移」（导演台 + 偏移调节），
+           所以还得知道每一格是哪个节点的，才能标清楚。
+         先算完，是因为前置行要不要往上补一格，得看下面第一格是谁。 */
+      const byStage = new Map();
+      const orderOf = new Map();
+      for (const f of [...g.size, ...g.sample]) {
+        const st = stageOf(f);
+        if (!byStage.has(st)) { byStage.set(st, new Map()); orderOf.set(st, []); }
+        const m = byStage.get(st);
+        if (!m.has(f.nodeId)) m.set(f.nodeId, []);
+        m.get(f.nodeId).push(f);
+        orderOf.get(st).push(f);
+      }
+      /* 只有一道采样时，「共用 / 一采」这种标签纯属添乱 —— 全部并回一堆 */
+      const realStages = new Set([...byStage.keys()].filter(s => s > 0));
+      if (realStages.size <= 1) {
+        const merged = new Map();
+        const mOrder = [];
+        for (const [st, owners] of byStage) {
+          mOrder.push(...orderOf.get(st));
           for (const [nid, fs] of owners) {
-            if (multiNode) {
-              const cap = document.createElement("div");
-              cap.className = "node-cap";
-              /* 两个同类节点（ImageConcatMulti ×2）得有个 #1 #2 才分得开 */
-              let name = nodeLabel(node, nid);
-              const dup = (capSeen.get(name) || 0) + 1;
-              capSeen.set(name, dup);
-              if (dup > 1) name += ` ${dup}`;
-              cap.textContent = name;
-              cap.title = `${node.prompt[nid]?.class_type || ""} · 节点 ${nid}`;
-              blk.appendChild(cap);
-            }
-            blk.appendChild(grid2(fs.map(f => fieldControl(f, node))));
+            if (!merged.has(nid)) merged.set(nid, []);
+            merged.get(nid).push(...fs);
           }
-          sb.appendChild(blk);
         }
+        byStage.clear();
+        byStage.set(0, merged);
+        orderOf.clear();
+        orderOf.set(0, mOrder);
+      }
+      const list = [...byStage.entries()].sort((a, b) => a[0] - b[0]);
+      const split = list.length > 1;
+      /* 只有真的重名（分辨率只有一个总像素、五个 VideoCombine 各一个帧率）才标节点名，
+         不重名就老老实实两列摆开，别加没用的字 */
+      const seenLabel = new Map();
+      for (const f of [...g.size, ...g.sample]) {
+        const n = cnName(f);
+        seenLabel.set(n, (seenLabel.get(n) || 0) + 1);
+      }
+      const ambiguous = [...seenLabel.values()].some(v => v > 1);
+      const multiNode = ambiguous && list.reduce((n, [, m]) => n + m.size, 0) > 1;
+      /* 节点名先统一算好：同类节点（ImageConcatMulti ×2、五段流程里一排四个
+         GetImageRangeFromBatch）得带序号才分得开。前置行里重名的那几格
+         也算进来一起编号，免得四个「帧数」的角标长得一模一样 */
+      const leadCnt = new Map();
+      for (const f of lead) { const n = cnName(f); leadCnt.set(n, (leadCnt.get(n) || 0) + 1); }
+      const needIds = [];
+      for (const [, owners] of list) for (const nid of owners.keys()) if (!needIds.includes(nid)) needIds.push(nid);
+      for (const f of lead) {
+        if (leadCnt.get(cnName(f)) < 2) continue;
+        if (!needIds.includes(f.nodeId)) needIds.push(f.nodeId);
+      }
+      const nameOf = new Map();
+      const baseCount = new Map();
+      for (const nid of needIds) {
+        const b = nodeLabel(node, nid);
+        baseCount.set(b, (baseCount.get(b) || 0) + 1);
+      }
+      const capSeen = new Map();
+      for (const nid of needIds) {
+        const base = nodeLabel(node, nid);
+        const dup = (capSeen.get(base) || 0) + 1;
+        capSeen.set(base, dup);
+        /* 序号放前面：角标窄的时候会被省略号截掉尾巴，
+           序号要是在后面就跟着一起没了，四格又变成一模一样。
+           同名的都给序号（包括第一个），不然第一格没号、后面从 #2 起，看着像缺了一个 */
+        nameOf.set(nid, baseCount.get(base) > 1 ? `#${dup} ${base}` : base);
+      }
+      const leadTag = (f) => leadCnt.get(cnName(f)) < 2 ? null : { tag: nameOf.get(f.nodeId) };
+      if (split) {
+        for (const [st, owners] of list) for (const fs of owners.values()) for (const f of fs) f._pass = st;
+      }
+      /* 前置行里也有重名的（五段工作流一排四个「帧数」，导演台两个「分段模式」），
+         这些也得带节点角标，否则四格长得一模一样，改哪个全靠猜 */
+
+      /* 前置行（画幅比例 / 画幅策略 / 分段模式 / 时长）紧跟提示词，这三格是「先定框架」：
+         模式决定吃哪种素材，画幅和时长决定宽高、帧数、步数。
+         单数时右下角会空半格 —— 把下面第一格挪上来补满，正好是「后面的参数往前移」 */
+      const taken = new Set();
+      const leadCells = lead.map(f => fieldControl(f, node, leadTag(f)));
+      if (lead.length && lead.length % 2 && list.length) {
+        const first = (orderOf.get(list[0][0]) || [])[0];
+        if (first) {
+          taken.add(first);
+          leadCells.push(fieldControl(first, node, multiNode ? { tag: nameOf.get(first.nodeId) } : null));
+        }
+      }
+      if (leadCells.length) sb.appendChild(grid2(leadCells));
+
+      for (const [st, owners] of list) {
+        const blk = document.createElement("div");
+        blk.className = "pass-blk p" + st;
+        const seq = (orderOf.get(st) || []).filter(f => !taken.has(f));
+        if (!seq.length) continue;
+        if (split) {
+          const h = document.createElement("div");
+          h.className = "pass-head";
+          h.innerHTML = `<span class="pass-tag">${PASS_CN[st] || st + " 采"}</span>`
+            + `<span class="pass-n">${seq.length} 项</span>`;
+          blk.appendChild(h);
+        }
+        /* 参数连着排成一张两列的网，不再一个节点一小块：
+           单字段节点（分辨率只有一个总像素、每个 VideoCombine 只有一个帧率）
+           以前各占一行、右边空半格，几个凑起来就是一大片空白。
+           节点名缩成角标挂在该组第一格的标签右边，归属照样看得清 */
+        let prevNid = null;
+        blk.appendChild(grid2(seq.map(f => {
+          const head = multiNode && f.nodeId !== prevNid;
+          prevNid = f.nodeId;
+          return fieldControl(f, node, head ? { tag: nameOf.get(f.nodeId) } : null);
+        })));
+        sb.appendChild(blk);
       }
 
       if (g.other.length) {
@@ -2473,12 +2813,11 @@ function renderNode(node) {
     /* ③ LoRA：名字在上面、强度紧贴在这条下面，一眼看出哪个强度配的哪个 LoRA */
     const loraOrder = [];
     for (const f of g.lora) if (!loraOrder.includes(f.nodeId)) loraOrder.push(f.nodeId);
-    /* ComfyUI 里被旁路的 LoRA 不在 prompt 里，画布上压根看不见。
-       不说明一句，会以为「明明开了 5 个 LoRA，怎么只显示 3 个」 */
-    const offLora = (node.uiWf?.nodes || [])
-      .filter(n => /lora/i.test(n.type || "") && (n.mode === 4 || n.mode === 2)).length;
-    if (loraOrder.length || offLora) {
-      const box = sectionBox(++secNo, "LoRA", loraOrder.length, false);
+    /* ComfyUI 里被旁路的 LoRA 不进 prompt，画布上原本整个看不见。
+       现在补成「已停用」的卡：看得见、点得到启用，不用回 ComfyUI 按 Ctrl+B */
+    const dormant = dormantLoras(node);
+    if (loraOrder.length || dormant.length) {
+      const box = sectionBox(++secNo, "LoRA", loraOrder.length + dormant.length, false);
       const sb = box.querySelector(".sec-body");
       /* 一采、二采各挂一整套 LoRA 时（导演台那种），标题必须写清楚是哪一道 */
       const stages = loraOrder.map(id => stg.get(String(id)) || 0);
@@ -2486,13 +2825,9 @@ function renderNode(node) {
       loraOrder.forEach((id, i) => {
         sb.appendChild(loraCard(node, g.lora.filter(f => f.nodeId === id), i + 1, tagOn ? stages[i] : null));
       });
-      if (offLora) {
-        const hint = document.createElement("div");
-        hint.className = "lora-offhint";
-        hint.textContent = `另有 ${offLora} 个 LoRA 在 ComfyUI 里是旁路（停用）状态，不参与生成`;
-        hint.title = "要它们生效就在 ComfyUI 里选中节点按 Ctrl+B 解旁路并保存，画布这边的 ⟳ 会同步过来";
-        sb.appendChild(hint);
-      }
+      dormant.forEach((d, i) => {
+        sb.appendChild(loraDormantCard(node, { ...d, idx: `LoRA ${loraOrder.length + i + 1}` }));
+      });
       body.appendChild(box);
     }
 
@@ -2546,14 +2881,16 @@ function grid2(items) {
 function loraCard(node, fs, idx, pass) {
   const id = fs[0]?.nodeId;
   const nd = node.prompt[id] || {};
+  const off = !!id && (node.assetOff || []).includes(String(id));
   const card = document.createElement("div");
-  card.className = "lora-card";
+  card.className = "lora-card" + (off ? " off" : "");
 
   const head = document.createElement("div");
   head.className = "lora-head";
   head.innerHTML = (pass === null || pass === undefined ? ""
     : `<span class="pass-tag${pass ? " p" + pass : ""}">${PASS_CN[pass] || ""}</span>`)
     + `<span class="lora-idx">LoRA ${idx}</span>`
+    + (off ? `<span class="lora-off-tag">已停用</span>` : "")
     + `<span class="lora-cls">${esc(String(nd.class_type || ""))}</span>`;
   card.appendChild(head);
 
@@ -2562,9 +2899,21 @@ function loraCard(node, fs, idx, pass) {
   if (nameF) card.appendChild(fieldControl(nameF, node));
 
   const strengths = ["strength_model", "strength_clip"].map(n => byName.get(n)).filter(Boolean);
-  if (strengths.length) {
-    const cells = strengths.map(f => fieldControl(f, node));
-    card.appendChild(strengths.length > 1 ? grid2(cells) : cells[0]);
+  /* 强度只占半格，右边那半格摆「不启用 / 启用」—— 一个 LoRA 少占一整行 */
+  const opCell = document.createElement("div");
+  opCell.className = "lora-ops-slot";
+  opCell.appendChild(loraOps(node, id, off, false));
+  if (strengths.length === 1) {
+    const row = document.createElement("div");
+    row.className = "lora-srow";
+    row.appendChild(fieldControl(strengths[0], node));
+    row.appendChild(opCell);
+    card.appendChild(row);
+  } else if (strengths.length > 1) {
+    card.appendChild(grid2(strengths.map(f => fieldControl(f, node))));
+    card.appendChild(opCell);
+  } else {
+    card.appendChild(opCell);
   }
 
   /* 强度被上游节点接走了（工作流里用 Float 节点驱动），这里只能说明一下 */
@@ -2576,6 +2925,79 @@ function loraCard(node, fs, idx, pass) {
     const srcName = node.prompt[src]?._meta?.title || node.prompt[src]?.class_type || src;
     tip.textContent = `强度由上游「${srcName}」控制`;
     card.appendChild(tip);
+  }
+  return card;
+}
+
+/** LoRA 的「启用 / 不启用」一行：跟素材同一套语义，节点不删、随时开回来 */
+function loraOps(node, id, off, text = true) {
+  const row = document.createElement("div");
+  row.className = "lora-ops";
+  const oid = String(id || "");
+  if (off) {
+    if (text) {
+      const tag = document.createElement("span");
+      tag.className = "lora-off";
+      tag.textContent = "已停用 · 这次生成不加载";
+      tag.title = "点「启用」让它重新参与，并把 ComfyUI 里这个节点解除旁路";
+      row.appendChild(tag);
+    }
+    const on = document.createElement("button");
+    on.className = "mini-btn on";
+    on.textContent = "启用";
+    on.title = "让这个 LoRA 重新参与生成，同时把 ComfyUI 里这份工作流的该节点解除旁路（mode 4 → 0）";
+    on.onclick = (e) => { e.stopPropagation(); setLoraOff(node, oid, false); };
+    row.appendChild(on);
+  } else {
+    const stop = document.createElement("button");
+    stop.className = "mini-btn stop";
+    stop.textContent = "不启用";
+    stop.title = "这次生成不加载这个 LoRA；节点不删，随时能开回来。同时把 ComfyUI 里这份工作流的该节点设为旁路（mode 0 → 4）";
+    stop.onclick = (e) => { e.stopPropagation(); setLoraOff(node, oid, true); };
+    row.appendChild(stop);
+  }
+  return row;
+}
+
+/** ComfyUI 里被旁路、prompt 里已经没有的 LoRA —— 补一张卡，好让人一键启用 */
+function dormantLoras(node) {
+  const live = new Set(Object.keys(node.prompt || {})
+    .filter(id => /lora/i.test(String(node.prompt[id]?.class_type || ""))));
+  return (node.uiWf?.nodes || [])
+    .filter(n => /lora/i.test(String(n.type || "")) && (n.mode === 4 || n.mode === 2) && !live.has(String(n.id)))
+    .map(n => {
+      const named = (n.widgets_values_named && typeof n.widgets_values_named === "object") ? n.widgets_values_named : null;
+      const arr = Array.isArray(n.widgets_values) ? n.widgets_values : null;
+      return {
+        id: String(n.id),
+        cls: String(n.type || ""),
+        name: named?.lora_name ?? (arr ? arr[0] : ""),
+        strength: named?.strength_model ?? (arr && arr.length > 1 ? arr[1] : null),
+      };
+    });
+}
+
+function loraDormantCard(node, info) {
+  const card = document.createElement("div");
+  card.className = "lora-card off";
+  const head = document.createElement("div");
+  head.className = "lora-head";
+  head.innerHTML = `<span class="lora-idx">${esc(info.idx)}</span>`
+    + `<span class="lora-cls">${esc(info.cls)}</span>`;
+  card.appendChild(head);
+  card.appendChild(loraOps(node, info.id, true));
+
+  const nm = document.createElement("div");
+  nm.className = "lora-name";
+  nm.textContent = info.name || "（ComfyUI 里这个 LoRA 是旁路状态）";
+  nm.title = `${info.cls} · 节点 ${info.id}`;
+  card.appendChild(nm);
+
+  if (info.strength !== null && info.strength !== undefined) {
+    const st = document.createElement("div");
+    st.className = "lora-ext";
+    st.textContent = `强度 ${info.strength}`;
+    card.appendChild(st);
   }
   return card;
 }
@@ -2605,15 +3027,19 @@ function slotZone(node, slots) {
 
     const row = document.createElement("div");
     row.className = "slot-kind";
-    if (cnt) {
+    if (cnt || shown.length) {
       const head = document.createElement("div");
       head.className = "slot-head";
       head.innerHTML = `<span>${KIND_NAME[kind]}</span><span class="slot-cnt">${cnt}/${max}</span>`;
       row.appendChild(head);
     }
 
+    /* 同类型横排：一格一个文件，按钮在格子底下 */
+    const grid = document.createElement("div");
+    grid.className = "slot-grid";
     shown.forEach((s, i) => {
-      row.appendChild(assetCard(slotField(node, s), node, {
+      grid.appendChild(assetCard(slotField(node, s), node, {
+        tile: true,
         slot: `${kind}:${s.idx}`,
         label: `${KIND_NAME[kind]} ${i + 1}`,     // 连续编号：空槽藏起来了，槽号会跳
         off: !!s.loader.byp || !!s.loader.mute,
@@ -2630,20 +3056,132 @@ function slotZone(node, slots) {
     if (canAdd) {
       const add = document.createElement("button");
       add.className = "slot-add";
-      /* 一个都没有时把计数写进按钮，省掉一整行空标题 */
-      add.textContent = cnt ? `＋ 添加${KIND_NAME[kind]}` : `＋ ${KIND_NAME[kind]}  ${cnt}/${max}`;
-      add.title = `上限 ${max} 个（取自工作流内置配置），已用 ${cnt} 个`;
+      /* 「＋」本身也是一格，跟素材格同宽，省掉一整行空标题 */
+      add.innerHTML = `<b>＋</b><span>${KIND_NAME[kind]}</span><i>${cnt}/${max}</i>`;
+      add.title = `添加一个${KIND_NAME[kind]}（上限 ${max} 个，取自工作流内置配置，已用 ${cnt} 个）`;
       add.onclick = () => addAssetSlot(node, kind);
-      row.appendChild(add);
+      grid.appendChild(add);
     }
+    row.appendChild(grid);
     wrap.appendChild(row);
   }
   return wrap;
 }
 
-/** 素材卡：缩略图 + 下拉 + 本地上传
+/* ==================================================================
+   拖进来就填 —— 素材库条目 / 本地文件直接落到某一格上
+   ──────────────────────────────────────────────────────────────────
+   以前只有「掉在画布空白处 = 建一个节点」这一条路，落在素材格上没人接，
+   于是从素材库往「参考图 3」那一格拖，什么也不会发生。现在格子和素材节点
+   自己接 drop：库里点住文件拖到格子上，就等于给这一格换文件。
+================================================================== */
+const LIB_DND = "application/x-wy-lib";      // 和素材库 dragstart 写进去的是同一个 MIME
+
+/** 这一拖带的是「素材库条目 / 本地文件」吗（dragover 阶段读不到 data，只能看 types） */
+function isFileDrag(e) {
+  const t = e.dataTransfer;
+  if (!t) return false;
+  const types = [...(t.types || [])];
+  return types.includes(LIB_DND) || types.includes("Files");
+}
+
+/** 素材库里的一条 → ComfyUI input 根目录里的文件名（LoadImage 只认根目录里的名字） */
+async function adoptLibFile(item) {
+  const type = item.type || "input";
+  const sub = item.sub || "";
+  if (type === "input" && !sub) return item.name;     // 已经在 input 根目录，直接用
+  const res = await fetch(api.viewUrl({ filename: item.name, subfolder: sub, type }));
+  if (!res.ok) throw new Error(`取文件失败 HTTP ${res.status}`);
+  const blob = await res.blob();
+  const ext = (item.name.match(/\.[a-z0-9]+$/i) || [""])[0];
+  const stem = (item.name.slice(0, item.name.length - ext.length) || "file")
+    .replace(/[^\w\-.\u4e00-\u9fff]/g, "_").slice(0, 60);
+  /* 名字固定住：同一个素材反复拖只覆盖同一个 input 文件，不会把 input 目录灌满 */
+  const f = new File([blob], `wy_${stem}${ext}`, { type: blob.type || "application/octet-stream" });
+  return await api.uploadImage(f);
+}
+
+/** 库条目 → 工作流节点的某一格 */
+async function useLibOnField(node, f, tt, item) {
+  if (item.kind && tt && item.kind !== tt) {
+    toast(`这是${KIND_CN[item.kind] || item.kind}，这一格要${KIND_CN[tt] || tt}`, "err");
+    return;
+  }
+  try {
+    const name = await adoptLibFile(item);
+    if (f.cls) patchChoices(f.cls, f.name, name);
+    commitAsset(node, f, name);
+    toast(`已用上：${item.name}`, "ok");
+  } catch (e) {
+    toast("引入失败：" + e.message, "err");
+  }
+}
+
+/** 库条目 → 素材节点（图像 / 视频 / 音频） */
+async function useLibOnInputNode(node, item) {
+  const want = node.inKind;
+  if (item.kind && want && item.kind !== want) {
+    toast(`这是${KIND_CN[item.kind] || item.kind}，这个节点要${KIND_CN[want] || want}`, "err");
+    return;
+  }
+  try {
+    const name = await adoptLibFile(item);
+    node.value = name;
+    node.src = api.viewUrl({ filename: name, type: "input" }) + "&t=" + Date.now();
+    node.pulled = null;                // 换成本机 input 文件，之前接住的产出作废
+    node.status = "done"; node.error = "";
+    renderNode(node);
+    save();
+    toast(`已用上：${item.name}`, "ok");
+  } catch (e) {
+    toast("引入失败：" + e.message, "err");
+  }
+}
+
+/** 给一个元素装上「拖到上面就能填」：库条目走 onLib，本地文件走 onFile */
+function takeDropOn(el, onLib, onFile) {
+  el.addEventListener("dragover", (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault(); e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    el.classList.add("drop-over");
+  });
+  el.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget && el.contains(e.relatedTarget)) return;
+    el.classList.remove("drop-over");
+  });
+  el.addEventListener("drop", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    el.classList.remove("drop-over");
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    const raw = dt.getData(LIB_DND);
+    if (raw) {
+      let it = null;
+      try { it = JSON.parse(raw); } catch { return; }
+      if (it?.name && onLib) onLib(it);
+      return;
+    }
+    const file = dt.files?.[0];
+    if (file && onFile) onFile(file);
+  });
+}
+
+/** 本地文件直接落到某一格：传进 input/ 再选用 */
+async function uploadFileOnField(node, f, tt, file) {
+  try {
+    const name = await api.uploadImage(file);
+    if (f.cls) patchChoices(f.cls, f.name, name);
+    commitAsset(node, f, name);
+    toast(`已上传并选用：${name}`, "ok");
+  } catch (e) {
+    toast("上传失败：" + e.message, "err");
+  }
+}
+
+/** 素材卡：缩略图 + 选文件 + 底下按钮
  *  meta = {label:「参考图 3」, off:工作流里就是 bypass, slot:"image:3",
- *          clearable, onClear, forced:用户手动停用} */
+ *          clearable, onClear, forced:用户手动停用, tile:摆成小方块（素材槽区用）} */
 function assetCard(f, node, meta = {}) {
   const tt = targetType(f);
   const cur = node.params[f.key] !== undefined ? node.params[f.key] : f.value;
@@ -2653,11 +3191,15 @@ function assetCard(f, node, meta = {}) {
   const nid = String(f.nodeId || "");
   const forced = !!(nid && (node.assetOff || []).includes(nid));
   const off = forced || !!meta.off;
+  const tile = !!meta.tile;
 
   const card = document.createElement("div");
-  card.className = "asset-card" + (miss ? " missing" : "") + (off ? " off" : "");
+  card.className = "asset-card" + (tile ? " tile" : "")
+    + (miss ? " missing" : "") + (off ? " off" : "");
   card.dataset.key = f.key;
   if (meta.slot) card.dataset.slot = meta.slot;
+  card.title = `${f.title || f.name}\n${cur || "未选择"}`
+    + (off ? "\n（这次不用它）" : "") + "\n\n拖素材库里的文件到这一格可以直接换";
 
   const port = document.createElement("span");
   port.className = "port in" + (inc ? "" : " pullable");
@@ -2668,7 +3210,7 @@ function assetCard(f, node, meta = {}) {
     ? `已接：「${nodeName(inc.from)}」· 想换就把这一格的线往外拖到别的输出口`
     : `从这一格往外拖 = 接一个${IN_KINDS[tt].label}（松手在空白处就新建一个）；也可以把别的输出线拖进来`;
 
-  /* 缩略图 */
+  /* 缩略图（方块模式把编号挂在左上角，省掉一整行标题） */
   const th = document.createElement("div");
   th.className = "asset-thumb";
   const url = hasFile ? api.viewUrl({ filename: cur, type: "input" }) : "";
@@ -2687,46 +3229,60 @@ function assetCard(f, node, meta = {}) {
   } else {
     th.textContent = "🎵";
   }
+  if (tile && meta.label) {
+    const tag = document.createElement("b");
+    tag.className = "th-tag";
+    tag.textContent = meta.label.replace(KIND_NAME[tt] + " ", "");
+    tag.title = meta.label;
+    th.appendChild(tag);
+  }
 
-  const main = document.createElement("div");
-  main.className = "asset-main";
-
-  const line = document.createElement("div");
-  line.className = "asset-line";
-
+  /* 选文件：接了线就是一枚来源 chip，没接线就是下拉 */
+  let pick;
   if (inc) {
-    line.appendChild(wiredChip(node, f.key, inc));
+    if (tile) {
+      pick = document.createElement("div");
+      pick.className = "wired compact";
+      pick.innerHTML = `<span class="wired-dot"></span>`
+        + `<span class="wired-t">${esc(nodeName(inc.from))}</span>`
+        + `<span class="wired-x">断</span>`;
+      pick.title = `由「${nodeName(inc.from)}」提供 · 点一下断开`;
+      pick.onclick = () => disconnect(node, f.key);
+    } else {
+      pick = wiredChip(node, f.key, inc);
+    }
   } else {
-    const sel = document.createElement("select");
+    pick = document.createElement("select");
     const opts = (f.choices || []).map(c => (c && typeof c === "object") ? (c.value ?? c.name ?? String(c)) : c);
     if (!hasFile) {
       /* 空槽：先摆一个「未选择」，别让下拉默认指到第一个文件假装选好了 */
       const o = document.createElement("option");
-      o.value = ""; o.textContent = "— 选一个文件 —";
+      o.value = ""; o.textContent = tile ? "— 未选 —" : "— 选一个文件 —";
       o.selected = true;
-      sel.appendChild(o);
+      pick.appendChild(o);
     }
     if (miss && hasFile) {
       const o = document.createElement("option");
       o.value = cur; o.textContent = "⚠ " + cur + "（不存在）";
       o.selected = true; o.disabled = true;
-      sel.appendChild(o);
+      pick.appendChild(o);
     }
     if (!opts.length) {
       const o = document.createElement("option");
       o.value = ""; o.textContent = "（无可选项）";
-      sel.appendChild(o);
+      pick.appendChild(o);
     }
     for (const o of opts) {
       const op = document.createElement("option");
       op.value = o; op.textContent = o;
       if (o === cur) op.selected = true;
-      sel.appendChild(op);
+      pick.appendChild(op);
     }
-    sel.onchange = () => commitAsset(node, f, sel.value);
-    line.appendChild(sel);
+    pick.onchange = () => commitAsset(node, f, pick.value);
   }
 
+  /* 底下（方块）/ 右边（整行）的按钮 */
+  const btns = [];
   /* 已经由上游节点供图的格子不用再上传，留着只会让两边的文件打架 */
   if (!inc) {
     const up = document.createElement("button");
@@ -2734,37 +3290,30 @@ function assetCard(f, node, meta = {}) {
     up.textContent = "上传";
     up.title = "从本机选一个文件，传进 ComfyUI 的 input 目录并直接选用";
     up.onclick = (e) => { e.stopPropagation(); pickAssetFile(node, f, tt); };
-    line.appendChild(up);
+    btns.push(up);
   }
-
   /* 启用 / 停用：
      · 停用 = 这次生成不用这个素材（节点还留在画布上，随时能开回来）
      · 工作流里本来就是 bypass 的，给一个明确的「启用」口 */
   if (!inc) {
-    if (forced) {
+    if (forced || (meta.off && hasFile)) {
       const on = document.createElement("button");
       on.className = "mini-btn on";
       on.textContent = "启用";
-      on.title = "重新把这一格接回生成流程";
+      on.title = forced
+        ? "重新把这一格接回生成流程"
+        : "把这个素材节点从 bypass 状态救回来，并接到参考槽上（同时写回 ComfyUI）";
       on.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, false); };
-      line.appendChild(on);
-    } else if (meta.off && hasFile) {
-      const on = document.createElement("button");
-      on.className = "mini-btn on";
-      on.textContent = "启用";
-      on.title = "把这个素材节点从 bypass 状态救回来，并接到参考槽上（同时写回 ComfyUI）";
-      on.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, false); };
-      line.appendChild(on);
+      btns.push(on);
     } else if (hasFile && nid) {
-      const off2 = document.createElement("button");
-      off2.className = "mini-btn stop";
-      off2.textContent = "不启用";
-      off2.title = "这次生成先不用这个素材，并同步把 ComfyUI 里的这个节点旁路（节点不删，随时能开回来）";
-      off2.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, true); };
-      line.appendChild(off2);
+      const stop = document.createElement("button");
+      stop.className = "mini-btn stop";
+      stop.textContent = tile ? "停用" : "不启用";
+      stop.title = "这次生成先不用这个素材，并同步把 ComfyUI 里的这个节点旁路（节点不删，随时能开回来）";
+      stop.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, true); };
+      btns.push(stop);
     }
   }
-
   /* 点「＋」露出来的空槽：不想用了能收回去 */
   if (meta.clearable && slotBlank(cur)) {
     const cl = document.createElement("button");
@@ -2772,21 +3321,50 @@ function assetCard(f, node, meta = {}) {
     cl.textContent = "收起";
     cl.title = "把这个空槽收回「＋ 添加」里";
     cl.onclick = (e) => { e.stopPropagation(); meta.onClear?.(); };
-    line.appendChild(cl);
+    btns.push(cl);
   }
 
-  main.appendChild(line);
+  /* 文件名一行：方块模式只有「停用/未生效/接了上游」才需要，其余信息缩略图和下拉里都有 */
+  let nm = null;
+  if (!tile || off) {
+    const nmText = inc ? `由「${nodeName(inc.from)}」提供` : (hasFile ? cur : "未选择");
+    nm = document.createElement("div");
+    nm.className = "asset-name";
+    nm.innerHTML = ((!tile && meta.label) ? `<b class="an-tag">${esc(meta.label)}</b>` : "")
+      + (tile ? "" : esc(nmText))
+      + (forced ? `<span class="an-off">已停用</span>` : (meta.off ? `<span class="an-off">未生效</span>` : ""));
+    nm.title = `${f.title} · ${f.name}\n${cur || ""}`;
+  }
 
-  const nm = document.createElement("div");
-  nm.className = "asset-name";
-  const nmText = inc ? `由「${nodeName(inc.from)}」提供` : (hasFile ? cur : "未选择");
-  nm.innerHTML = (meta.label ? `<b class="an-tag">${esc(meta.label)}</b>` : "")
-    + esc(nmText)
-    + (forced ? `<span class="an-off">已停用</span>` : (meta.off ? `<span class="an-off">未生效</span>` : ""));
-  nm.title = `${f.title} · ${f.name}\n${cur || ""}`;
-  main.appendChild(nm);
+  if (tile) {
+    card.appendChild(th);
+    const pickRow = document.createElement("div");
+    pickRow.className = "asset-line pick";
+    pickRow.appendChild(pick);
+    card.appendChild(pickRow);
+    if (btns.length) {
+      const row = document.createElement("div");
+      row.className = "asset-line btns";
+      for (const b of btns) row.appendChild(b);
+      card.appendChild(row);
+    }
+    if (nm) card.appendChild(nm);
+  } else {
+    const line = document.createElement("div");
+    line.className = "asset-line";
+    line.appendChild(pick);
+    for (const b of btns) line.appendChild(b);
+    const main = document.createElement("div");
+    main.className = "asset-main";
+    main.append(line, nm);
+    card.append(th, main);
+  }
+  card.appendChild(port);
 
-  card.append(th, main, port);
+  /* 素材库 / 本地文件拖到这一格 = 直接换文件 */
+  takeDropOn(card,
+    (item) => useLibOnField(node, f, tt, item),
+    (file) => uploadFileOnField(node, f, tt, file));
   return card;
 }
 
@@ -2807,18 +3385,9 @@ function pickAssetFile(node, f, tt) {
   const inp = document.createElement("input");
   inp.type = "file";
   inp.accept = IN_KINDS[tt]?.accept || "";
-  inp.onchange = async () => {
+  inp.onchange = () => {
     const file = inp.files?.[0];
-    if (!file) return;
-    node.progress = "上传中…";
-    try {
-      const name = await api.uploadImage(file);
-      patchChoices(f.cls, f.name, name);
-      commitAsset(node, f, name);
-      toast(`已上传并选用：${name}`, "ok");
-    } catch (e) {
-      toast("上传失败：" + e.message, "err");
-    }
+    if (file) uploadFileOnField(node, f, tt, file);
   };
   inp.click();
 }
@@ -3119,6 +3688,19 @@ function lockedKeysOf(node) {
   return s;
 }
 
+/** 上游产出落到磁盘：output 里的取回来、重传一份进 input/；本来就在 input 的直接用。
+    文件名固定成 wy_<上游>_<下游>.ext —— 同一条边反复跑只会覆盖同一个文件 */
+async function materializeUpstream(node, src, v, want) {
+  if (v.direct) return v.filename;
+  node.progress = `传入「${src.name}」的${WANT_CN[want] || "文件"}…`;
+  renderNode(node);
+  const blob = await api.fetchBlob(v);
+  const ext = (v.filename.match(/\.[a-z0-9]+$/i) || [".png"])[0];
+  const tag = `${src.id}_${node.id}`.replace(/[^a-z0-9_-]/gi, "");
+  const file = new File([blob], `wy_${tag}${ext}`, { type: blob.type || "application/octet-stream" });
+  return api.uploadImage(file);
+}
+
 async function runNode(node, _seen = new Set()) {
   if (node.status === "running" || _seen.has(node.id)) return;
   _seen.add(node.id);
@@ -3151,7 +3733,17 @@ async function runNode(node, _seen = new Set()) {
     for (const [k, v] of Object.entries(node.params || {})) {
       if (lockedKeys.has(k)) continue;
       const [nid, field] = k.split("|");
-      if (prompt[nid]?.inputs && field) prompt[nid].inputs[field] = v;
+      if (!prompt[nid]?.inputs || !field) continue;
+      /* 这个口是被圈里的线驱动的（时长这类由上游算出）：不许拿面板旧值把它顶掉 */
+      if (Array.isArray(prompt[nid].inputs[field])) continue;
+      prompt[nid].inputs[field] = v;
+      /* 导演台的分段模式：时间线 JSON 里的 taskType 优先级更高，
+         只改 widget 等于没改，这里跟着写回时间线 */
+      if (RE_MODE.test(field) && DIRECTOR_CLS.test(String(prompt[nid].class_type || ""))) {
+        prompt[nid].inputs.timeline_data = patchTimeline(prompt[nid].inputs.timeline_data, (tl) => {
+          (tl.global = tl.global || {}).taskType = v;
+        });
+      }
     }
 
     /* 3) 把连线上游的产出塞进目标输入：文本直接赋值，文件先传进 input/
@@ -3163,6 +3755,23 @@ async function runNode(node, _seen = new Set()) {
       const nid = e.key.slice(0, bar), field = e.key.slice(bar + 1);
       if (!prompt[nid]?.inputs || !field) continue;
 
+      /* 导演台的源视频：没有可以赋值的连线口，得把文件 + 帧数写进时间线 */
+      if (field === DIRECTOR_VIDEO_KEY) {
+        const v = upstreamValue(src, "video");
+        if (!v || "value" in v) throw new Error(`「${src.name}」没产出视频，接不了导演台的源视频`);
+        node.progress = `传入「${src.name}」的视频…`;
+        renderNode(node);
+        const fname = await materializeUpstream(node, src, v, "video");
+        const meta = await libProbeVideo("input", "", fname);
+        const mode = ensureDirectorVideoMode(node, nid);
+        const next = applyDirectorVideo(node, nid, fname, meta);
+        if (!next) throw new Error("导演台的时间线读不出来（timeline_data 不是合法 JSON），没法写源视频");
+        prompt[nid].inputs.timeline_data = next;
+        prompt[nid].inputs.task_type = mode || prompt[nid].inputs.task_type;
+        node.wired = { from: src.name, kind: "video", file: fname };
+        continue;
+      }
+
       const want = fieldWant(prompt, nid, field);
       const v = upstreamValue(src, want);
       if (!v) throw new Error(`「${src.name}」还没准备好，先把它跑出来（要的是${WANT_CN[want] || "内容"}）`);
@@ -3173,20 +3782,15 @@ async function runNode(node, _seen = new Set()) {
         continue;
       }
 
-      let fname = v.filename;
-      if (!v.direct) {
-        node.progress = `传入「${src.name}」的${WANT_CN[want] || "文件"}…`;
-        renderNode(node);
-        const blob = await api.fetchBlob(v);
-        const ext = (v.filename.match(/\.[a-z0-9]+$/i) || [".png"])[0];
-        /* 用「边」的名字固定住，重复跑只会覆盖同一个文件，input 目录不会被灌满 */
-        const tag = `${src.id}_${node.id}`.replace(/[^a-z0-9_-]/gi, "");
-        const file = new File([blob], `wy_${tag}${ext}`, { type: blob.type || "application/octet-stream" });
-        fname = await api.uploadImage(file);
-      }
+      const fname = await materializeUpstream(node, src, v, want);
       prompt[nid].inputs[field] = fname;
       node.wired = { from: src.name, kind: want, file: fname };
     }
+
+    /* 3.4) 用户停用的 LoRA：不能像素材那样「把指向它的线删掉」——
+           下游的 MODEL / CLIP 口一删就没输入，ComfyUI 只会回一句 Required input is missing。
+           按 bypass 的原意办：把它摘掉，下游直接接回它自己的上游（类别对得上的那一路） */
+    if (node.assetOff?.length) bypassLoraInPrompt(prompt, node.assetOff);
 
     /* 3.5) 用户停用的素材：从提交副本里摘掉节点，连同所有指向它的连线
             （node.prompt 本身不动，画布上那一格还在，随时能开回来） */
@@ -3213,6 +3817,8 @@ async function runNode(node, _seen = new Set()) {
       }
     }
 
+    /* 内联来源只给面板看，不进提交体 */
+    for (const nd of Object.values(prompt)) if (nd?._meta?.inlined) delete nd._meta.inlined;
     const id = await api.submit(expandPromptTokens(prompt));
     node.progress = "运行中…";
     renderNode(node);
@@ -3276,6 +3882,483 @@ function createPulledInput(target, key, kind, cx, cy) {
 }
 
 /* ==================================================================
+   素材往下游：挑一个「能吃这种素材」的工作流
+   ──────────────────────────────────────────────────────────────────
+   以前从素材节点往外拖、在空白处松手，只会再建一个「图像输入」——
+   素材接素材，等于原地打转。现在改成：先把画布里所有工作流过一遍，
+   看谁的输入口能吃这种素材（图接图、视频接视频、文本接文本），列出来
+   让人挑；挑中就把素材接到它第一个能用的槽位上，跑的时候自动把文件
+   送进 input/。一个都吃不下时才退回「建一个素材节点」。
+
+   「能吃」怎么判：把工作流转成 prompt 之后，看它有没有能接素材的槽
+   （autogrow 的 ref_images 之类）或能拉线的字段（LoadImage 的 image、
+   LoadVideo 的 video、prompt 这类 STRING）。判定和真正接线时用的是同一套，
+   所以列出来的必然接得上。被 bypass / mute 的加载节点也算 —— 接上会顺手
+   救活它，不然接上去等于没接。
+================================================================== */
+const FEED_CN = { text: "文本", image: "图片", video: "视频", audio: "音频" };
+
+const wfIntake = new Map();          // file -> Set<kind>；失败时存 Error，别每次拖线都重试
+function resetWfIntake() { wfIntake.clear(); }
+
+/** 工作流里被 bypass / mute 掉、但下游还活着的加载节点。
+    它们不在 prompt 里（画布上暂时看不见），接上素材时能把它救活 —— 也算「能吃」。
+    下游也全是停用的不算：那种分支整条都没通，救活一个加载节点也是白接。 */
+function dormantLoaders(uiWf) {
+  const nodes = uiWf?.nodes || [];
+  const byLink = new Map();
+  for (const n of nodes) for (const s of n.inputs || []) if (s.link != null) byLink.set(s.link, n);
+  const off = (n) => (n?.mode ?? 0) === 2 || (n?.mode ?? 0) === 4;
+
+  const out = [];
+  for (const n of nodes) {
+    if (!off(n)) continue;
+    const links = [];
+    for (const o of n.outputs || []) for (const l of o.links || []) links.push(l);
+    if (!links.length) continue;
+    if (!links.some(l => byLink.get(l) && !off(byLink.get(l)))) continue;
+    const info = S.oi?.[n.type];
+    if (!info) continue;
+    const w = listWidgets(info).find(x => targetType({ cls: n.type, name: x.name, type: x.type }));
+    if (!w) continue;
+    const kind = targetType({ cls: n.type, name: w.name, type: w.type });
+    out.push({ id: String(n.id), cls: n.type, field: w.name, kind });
+  }
+  return out;
+}
+
+/** 扫一份工作流文件，看它有哪些口真的能接素材
+    （判定跟真正接线时用的是同一套：素材槽 + 能拉线的字段 + 休眠的加载节点，
+      所以「列出来」的必然「接得上」，不会出现点了没反应） */
+function intakeKindsOf(uiWf) {
+  const { prompt } = convertWorkflow(uiWf, S.oi);
+  const probe = { prompt, uiWf, params: {}, extraSlots: [], assetOn: [], assetOff: [] };
+  const kinds = new Set();
+  const info = collectAssetSlots(probe);
+  for (const s of info.slots) kinds.add(s.kind);
+  const fields = buildFields(probe);
+  for (const f of fields) {
+    const tt = targetType(f);
+    if (tt) kinds.add(tt);
+  }
+  for (const d of dormantLoaders(uiWf)) kinds.add(d.kind);
+  /* autogrow 口还留着容量、只是图里没摆加载节点的工作流（h3 的参考视频口就是这样）
+     —— 接线时会补一个空槽，所以它其实吃得住。带时长参数的按视频流算，
+     其余按容量算（参考图那类）。 */
+  for (const k of ["image", "video", "audio"]) {
+    if (!kinds.has(k) && info.limits[k] > 0) kinds.add(k);
+  }
+  /* 导演台：源视频在时间线里（不是连线口），分段模式切到 v2v / rv2v 才出现 —— 
+     入口是有的，只是要切模式，所以带导演台的工作流一律算能吃视频 */
+  if (Object.values(prompt).some(nd => DIRECTOR_CLS.test(String(nd?.class_type || "")))) kinds.add("video");
+  return kinds;
+}
+
+/** 参数里有没有「时长」这一类（duration / 帧数）—— 有就是跑视频的流 */
+function hasDurationParam(fields) {
+  return (fields || []).some(f => !f.locked && RE_DURATION.test(f.name));
+}
+
+async function intakeOf(wf) {
+  const hit = wfIntake.get(wf.file);
+  if (hit instanceof Error) throw hit;
+  if (hit) return hit;
+  try {
+    const kinds = intakeKindsOf(await api.getWorkflow(wf.file));
+    wfIntake.set(wf.file, kinds);
+    return kinds;
+  } catch (e) {
+    wfIntake.set(wf.file, e instanceof Error ? e : new Error(String(e)));
+    throw e;
+  }
+}
+
+/** 能吃 kind 的工作流清单（并发 4 个，边扫边报进度） */
+async function intakeCandidates(kind, onTick) {
+  const queue = [...(S.workflows || [])];
+  const all = queue.length;
+  const out = [];
+  let done = 0;
+  const run = async () => {
+    while (queue.length) {
+      const w = queue.shift();
+      try { if ((await intakeOf(w)).has(kind)) out.push(w); } catch { }
+      done++;
+      try { onTick?.(done, all); } catch { }
+    }
+  };
+  await Promise.all([run(), run(), run(), run()]);
+  out.sort((a, b) => a.name.localeCompare(b.name, "zh"));
+  return out;
+}
+
+/* ---------- 选择器：贴在鼠标旁边的小面板 ---------- */
+let pickerEl = null, pickerOff = [];
+
+function closeWfPicker() {
+  for (const fn of pickerOff) { try { fn(); } catch { } }
+  pickerOff = [];
+  pickerEl?.remove();
+  pickerEl = null;
+}
+
+function openWfPicker({ kind, fromId, at, sx, sy, fallback }) {
+  closeWfPicker();
+  const cn = FEED_CN[kind] || kind;
+  const altLabel = IN_KINDS[kind]?.label || cn;
+
+  const el = document.createElement("div");
+  el.className = "wfpick";
+  el.innerHTML = `
+    <div class="wfpick-head">
+      <span class="wfpick-ico">${IN_KINDS[kind]?.ico || "📄"}</span>
+      <span class="wfpick-title">接一个能吃「${cn}」的工作流</span>
+      <button class="wfpick-x" title="取消（Esc）">✕</button>
+    </div>
+    <input class="wfpick-q" placeholder="搜工作流…" spellcheck="false" autocomplete="off">
+    <div class="wfpick-list"><div class="wfpick-hint">正在看各个工作流的输入口…</div></div>
+    <div class="wfpick-foot"></div>`;
+  document.body.appendChild(el);
+  pickerEl = el;
+
+  const q = el.querySelector(".wfpick-q");
+  const listEl = el.querySelector(".wfpick-list");
+  const footEl = el.querySelector(".wfpick-foot");
+  let items = [], shown = [], active = 0, loading = true;
+
+  const place = () => {
+    const r = el.getBoundingClientRect();
+    const left = Math.max(10, Math.min(sx + 14, innerWidth - r.width - 10));
+    const top = Math.max(10, Math.min(sy + 12, innerHeight - r.height - 10));
+    el.style.left = left + "px";
+    el.style.top = top + "px";
+  };
+
+  const paint = () => {
+    [...listEl.querySelectorAll(".wfpick-item")]
+      .forEach((b, i) => b.classList.toggle("active", i === active));
+    listEl.querySelector(".wfpick-item.active")?.scrollIntoView({ block: "nearest" });
+  };
+
+  const foot = () => {
+    if (loading) { footEl.innerHTML = `<span class="wfpick-kbd">识别中…</span>`; return; }
+    footEl.innerHTML = `<button class="wfpick-alt">＋ 只建一个「${altLabel}」</button>
+      <span class="wfpick-kbd">↑↓ 选 · Enter 接上 · Esc 取消</span>`;
+    footEl.querySelector(".wfpick-alt").onclick = () => { closeWfPicker(); fallback?.(); };
+  };
+
+  const render = () => {
+    if (loading) return;
+    const kw = q.value.trim().toLowerCase();
+    shown = items.filter(w => !kw || w.name.toLowerCase().includes(kw));
+    if (!shown.length) {
+      listEl.innerHTML = items.length
+        ? `<div class="wfpick-hint">没有名字里带「${esc(q.value.trim())}」的工作流</div>`
+        : `<div class="wfpick-hint">画布里的工作流都吃不下${cn}。<br>
+            换一个工作流再来，或者就建一个${cn}节点放着。</div>`;
+      place();
+      return;
+    }
+    listEl.innerHTML = "";
+    shown.forEach((w, i) => {
+      const set = wfIntake.get(w.file);
+      const tags = ["image", "video", "audio", "text"]
+        .filter(k => set instanceof Set && set.has(k))
+        .map(k => `<span class="wfpick-tag${k === kind ? " on" : ""}">${IN_KINDS[k]?.short || "文"}</span>`)
+        .join("");
+      const b = document.createElement("button");
+      b.className = "wfpick-item" + (i === active ? " active" : "");
+      b.title = w.file;
+      b.innerHTML = `<span class="wfpick-name">${esc(w.name)}</span><span class="wfpick-tags">${tags}</span>`;
+      b.onclick = () => choose(w);
+      b.onmouseenter = () => { active = i; paint(); };
+      listEl.appendChild(b);
+    });
+    place();
+  };
+
+  const choose = (w) => {
+    closeWfPicker();
+    chainIntoWorkflow(w, kind, fromId, at);
+  };
+
+  q.addEventListener("input", () => { active = 0; render(); });
+  el.querySelector(".wfpick-x").onclick = () => closeWfPicker();
+
+  const onKey = (e) => {
+    if (!pickerEl) return;
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeWfPicker(); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!shown.length) return;
+      e.preventDefault(); e.stopPropagation();
+      active = (active + (e.key === "ArrowDown" ? 1 : shown.length - 1)) % shown.length;
+      paint();
+      return;
+    }
+    if (e.key === "Enter" && !loading) {
+      const w = shown[active];
+      if (w) { e.preventDefault(); e.stopPropagation(); choose(w); }
+    }
+  };
+  document.addEventListener("keydown", onKey, true);
+  pickerOff.push(() => document.removeEventListener("keydown", onKey, true));
+
+  /* 点面板外面 = 取消。延一帧再挂监听，免得被「松手」那一发指针事件立刻关掉 */
+  const onDown = (e) => { if (!el.contains(e.target)) closeWfPicker(); };
+  setTimeout(() => {
+    if (pickerEl !== el) return;
+    document.addEventListener("pointerdown", onDown, true);
+    pickerOff.push(() => document.removeEventListener("pointerdown", onDown, true));
+  }, 0);
+
+  foot(); place(); q.focus();
+
+  if (!S.oi || !(S.workflows || []).length) {
+    loading = false; items = []; foot(); render();
+    return;
+  }
+  intakeCandidates(kind, (done, all) => {
+    if (pickerEl !== el) return;
+    footEl.innerHTML = `<span class="wfpick-kbd">正在识别工作流的输入口 ${done}/${all}…</span>`;
+  }).then(list => {
+    if (pickerEl !== el) return;
+    loading = false; items = list; active = 0; foot(); render();
+  }).catch(() => {
+    if (pickerEl !== el) return;
+    loading = false; items = []; foot(); render();
+  });
+}
+
+/** 挑中一个工作流：落到松手的位置，把素材接到它第一个能用的槽上 */
+async function chainIntoWorkflow(wf, kind, fromId, at) {
+  const node = await addWorkflowNode(wf, { x: at.x - 8, y: at.y - 24 });
+  if (!node) return null;
+  const hit = pickIntake(node, kind);
+  if (!hit) {
+    toast(`「${wf.name}」里没找到能接${FEED_CN[kind] || kind}的口，节点先落下了`, "err", 4600);
+    return node;
+  }
+  /* 那个加载节点本来是 bypass 的：接上就得救活，否则等于没接 */
+  if (hit.bypass) reviveLoader(node, hit.loaderId);
+  /* 素材槽光有线还不够：采样节点的 ref_images.N 得显式指到加载节点上 */
+  if (hit.slot) wireSlotGroup(node, hit.slot);
+  S.edges = S.edges.filter(e => !(e.to === node.id && e.key === hit.key));
+  S.edges.push({ from: fromId, to: node.id, key: hit.key, type: kind });
+  view.setEdges(S.edges);
+  renderNode(node);
+  save();
+  toast(hit.director
+    ? `已接上：「${nodeName(fromId)}」的视频会写进「${node.name}」的导演台时间线，分段模式切到 v2v`
+    : `已接上：「${nodeName(fromId)}」→「${node.name}」的${hit.label}`, "ok", hit.director ? 5200 : 3800);
+  return node;
+}
+
+/** 把槽号显式写进 autogrow 口（不然空槽接上素材，采样节点压根不知道用第几个） */
+function wireSlotGroup(node, slot) {
+  for (const g of collectAssetSlots(node).groups) {
+    if (g.group !== slot.gkey) continue;
+    const t = node.prompt[g.pid];
+    if (!t?.inputs) continue;
+    t.inputs[g.group + "." + g.item + slot.idx] = [String(slot.loader.id), 0];
+  }
+}
+
+/* ==================================================================
+   导演台：模式 + 源视频
+   ──────────────────────────────────────────────────────────────────
+   导演台（MiniMaxH3Director）是个「整台」节点：图 / 视频 / 音频都不在连线口上，
+   全在 timeline_data 那段 JSON 里 —— 分段模式切到 v2v / rv2v 之后，
+   源视频从 timeline.video 进来。所以：
+     · 判定「能吃视频」看的是有没有导演台（它的入口随模式开关）；
+     · 真接的时候，把文件名和帧数写进 timeline_data，顺手把模式切到 v2v。
+================================================================== */
+const DIRECTOR_CLS = /^(Comfy)?MiniMaxH3Director$/i;
+const DIRECTOR_VIDEO_MODE = /^(v2v|rv2v)\b/i;
+
+/** 这个工作流里的导演台节点（一个工作流最多一个） */
+function directorOf(node) {
+  for (const [id, nd] of Object.entries(node.prompt || {})) {
+    if (DIRECTOR_CLS.test(String(nd?.class_type || ""))) return { id, nd };
+  }
+  return null;
+}
+
+/** 改时间线 JSON：字符串进、字符串出；解析失败就原样退回（别把人家的工作流搅坏） */
+function patchTimeline(str, fn) {
+  if (typeof str !== "string" || !str.trim()) return str;
+  let o;
+  try { o = JSON.parse(str); } catch { return str; }
+  if (!o || typeof o !== "object") return str;
+  try { fn(o); } catch { return str; }
+  return JSON.stringify(o);
+}
+
+function patchDirectorTimeline(node, dirId, fn) {
+  const t = node.prompt?.[dirId]?.inputs;
+  if (!t || typeof t.timeline_data !== "string") return "";
+  const next = patchTimeline(t.timeline_data, fn);
+  t.timeline_data = next;
+  return next;
+}
+
+/** 导演台的分段模式这一格（值得改的是它带着的可选值） */
+function directorModeField(node, dirId) {
+  return buildFields(node).find(f => String(f.nodeId) === String(dirId) && RE_MODE.test(f.name)) || null;
+}
+
+const modeVal = (v) => String(v && typeof v === "object" ? (v.value ?? v.name ?? "") : (v ?? ""));
+
+/** 让导演台切到能吃视频的模式（已经是 v2v / rv2v 就不动），返回切成了什么 */
+function ensureDirectorVideoMode(node, dirId) {
+  const f = directorModeField(node, dirId);
+  if (!f) return "";
+  const cur = modeVal(node.params?.[f.key] ?? f.value);
+  if (DIRECTOR_VIDEO_MODE.test(cur)) return cur;
+  const choices = (f.choices || []).map(modeVal);
+  const want = choices.find(c => /^v2v\b/i.test(c)) || choices.find(c => /^rv2v\b/i.test(c)) || "";
+  if (!want) return "";
+  node.params = node.params || {};
+  node.params[f.key] = want;
+  /* 时间线里的 taskType 优先级比 widget 高，只改 widget 等于没改 */
+  patchDirectorTimeline(node, dirId, (tl) => { (tl.global = tl.global || {}).taskType = want; });
+  return want;
+}
+
+/** 把一段视频写进导演台时间线（v2v 的源视频只有这一个入口） */
+function applyDirectorVideo(node, dirId, fname, meta) {
+  const fps = Math.max(1, Math.round(Number(meta?.fps) || 24));
+  const frames = Math.max(1, Math.round(Number(meta?.frames) || 0));
+  const w = Math.round(Number(meta?.width) || 0);
+  const h = Math.round(Number(meta?.height) || 0);
+  const next = patchDirectorTimeline(node, dirId, (tl) => {
+    tl.timelineMode = "video";
+    tl.editMode = "global";
+    tl.totalFrames = frames;
+    tl.frameRate = fps;
+    if (w && h) { tl.width = w; tl.height = h; }
+    tl.video = {
+      ...(tl.video || {}),
+      fileName: fname, videoFile: fname, subfolder: "", type: "input",
+      frames: [], frameMap: [], deletedSourceRanges: [],
+      sourceFrameCount: frames, width: w, height: h,
+      storageWidth: w, storageHeight: h,
+    };
+    /* 换源视频 = 时间线重来：旧的片段 / 关键帧对不上新片子的长度，留着必定报错 */
+    tl.videoClips = [];
+    tl.segments = [];
+    tl.shots = [];
+    tl.keyframes = [];
+    tl.global = { ...(tl.global || {}) };
+    if (!DIRECTOR_VIDEO_MODE.test(String(tl.global.taskType || ""))) {
+      const mode = modeVal(node.params?.[directorModeField(node, dirId)?.key]) || "v2v — 视频转视频(Video to Video)";
+      tl.global.taskType = mode;
+    }
+  });
+  return next;
+}
+
+/** 导演台这一路「源视频」的连线 key（不是真字段，用 @ 前缀区分） */
+const DIRECTOR_VIDEO_KEY = "@video";
+
+/** 这个工作流里接 kind 最好的一格：空着的槽优先、没被停用的优先 */
+function pickIntake(node, kind) {
+  const info = collectAssetSlots(node);
+  const mine = info.slots.filter(s => s.kind === kind);
+  if (mine.length) {
+    const score = (s) => (s.loader.byp || s.loader.mute ? 2 : 0) + (slotBlank(s.value) ? 0 : 1);
+    const s = [...mine].sort((a, b) => score(a) - score(b) || a.idx - b.idx)[0];
+    return {
+      key: s.loader.id + "|" + s.loader.field,
+      loaderId: s.loader.id,
+      bypass: !!(s.loader.byp || s.loader.mute),
+      label: `${KIND_NAME[kind]} ${s.idx + 1}`,
+      slot: s,
+    };
+  }
+  /* 导演台：视频不走连线口，走时间线的源视频 —— 切到 v2v 模式才出现，所以单独一档 */
+  if (kind === "video") {
+    const dir = directorOf(node);
+    if (dir) {
+      const mode = ensureDirectorVideoMode(node, dir.id);
+      return {
+        key: dir.id + "|" + DIRECTOR_VIDEO_KEY, loaderId: dir.id, bypass: false,
+        director: dir.id, label: `源视频（导演台·${mode ? mode.split(/[ —]/)[0] : "v2v"}）`,
+      };
+    }
+  }
+  /* 没有 autogrow 素材槽的工作流：退回按字段找
+     文本要挑「正向」那一格 —— 按名字排序，负向的排到最后，
+     不然拖一段提示词进去会直接落到 negative 上 */
+  const can = buildFields(node).filter(f => targetType(f) === kind);
+  if (can.length) {
+    const nameRank = (f) => {
+      if (kind !== "text") return 0;
+      if (/negative/i.test(f.name)) return 3;
+      if (/positive|^prompt$|^text$|^instruction$|^description$/i.test(f.name)) return 0;
+      return /prompt|text/i.test(f.name) ? 1 : 2;
+    };
+    const blankRank = (f) => (slotBlank(node.params[f.key] ?? f.value) ? 0 : 1);
+    const pick = [...can].sort((a, b) => nameRank(a) - nameRank(b) || blankRank(a) - blankRank(b))[0];
+    return {
+      key: pick.key, loaderId: String(pick.nodeId), bypass: false,
+      label: cnName(pick) || KIND_NAME[kind],
+    };
+  }
+  /* 容量还空着、只是工作流里没摆加载节点（h3 的参考视频口）：先补一个空槽再接，
+     不然这种流永远「能吃但接不上」 */
+  if ((info.limits[kind] || 0) > 0) {
+    const before = new Set(info.slots.map(s => s.loader.id + "|" + s.loader.field));
+    addAssetSlot(node, kind);
+    const fresh = collectAssetSlots(node).slots
+      .filter(s => s.kind === kind && !before.has(s.loader.id + "|" + s.loader.field))
+      .sort((a, b) => a.idx - b.idx)[0];
+    if (fresh) {
+      return {
+        key: fresh.loader.id + "|" + fresh.loader.field,
+        loaderId: fresh.loader.id,
+        bypass: false,
+        label: `${KIND_NAME[kind]} ${fresh.idx + 1}`,
+        slot: fresh,
+      };
+    }
+  }
+  /* 最后一档：工作流里那个加载节点被 bypass 了，接上先把它救活 */
+  const dor = dormantLoaders(node.uiWf).find(d => d.kind === kind);
+  if (dor) {
+    return {
+      key: dor.id + "|" + dor.field, loaderId: dor.id, bypass: true,
+      label: `${KIND_CN[kind] || ""}加载节点`,
+    };
+  }
+  return null;
+}
+
+/** 把工作流里被 bypass / mute 掉的加载节点救活（只改内存副本，不动磁盘文件） */
+function reviveLoader(node, loaderId) {
+  const ui = (node.uiWf?.nodes || []).find(n => String(n.id) === String(loaderId));
+  if (!ui) return false;
+  ui.mode = 0;
+  const { prompt } = convertWorkflow(node.uiWf, S.oi);
+  node.prompt = prompt;
+  restoreExtraSlots(node);
+  node.assetOn = [...new Set([...(node.assetOn || []), String(loaderId)])];
+  node.assetOff = (node.assetOff || []).filter(x => x !== String(loaderId));
+  return true;
+}
+
+/** 兜底的老路：就在这儿落一个素材节点并接上 */
+function pullIntoInputNode(fromId, kind, w) {
+  const n = addInputNode(kind, { x: w.x - 20, y: w.y - 30 });
+  if (!n) { view.scheduleEdges(); return null; }
+  S.edges.push({ from: fromId, to: n.id, key: null, type: kind });
+  view.setEdges(S.edges);
+  renderNode(n);
+  save();
+  toast(`已建「${n.name}」并连上：跑完「${nodeName(fromId)}」的产出会显示在这个节点里`, "ok");
+  return n;
+}
+
+/* ==================================================================
    素材库：直连 ComfyUI 的 input / output
 ================================================================== */
 const fmtSize = (n) => {
@@ -3292,6 +4375,12 @@ async function libReq(path, opts) {
   try { j = await r.json(); } catch { }
   if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
   return j ?? {};
+}
+
+/** 视频的帧数 / 帧率 / 宽高：导演台 v2v 的时间线要靠它把源视频写准 */
+function libProbeVideo(kind, sub, name) {
+  return libReq(`/api/lib/probe?kind=${encodeURIComponent(kind)}`
+    + `&sub=${encodeURIComponent(sub || "")}&name=${encodeURIComponent(name)}`);
 }
 
 async function libInit() {
@@ -3437,7 +4526,7 @@ function libItemCard(it) {
   const el = document.createElement("div");
   el.className = "lib-item" + (S.lib.sel.has(key) ? " picked" : "");
   el.draggable = true;
-  el.title = `${it.name}\n${kind}/${it.sub || "根目录"}\n${fmtSize(it.size)}\n拖到画布即可使用`;
+  el.title = `${it.name}\n${kind}/${it.sub || "根目录"}\n${fmtSize(it.size)}\n拖到画布空白处 = 建节点\n拖到素材格 / 图像输入节点上 = 直接换文件`;
 
   const th = document.createElement("div");
   th.className = "li-thumb";
@@ -3480,6 +4569,13 @@ function libItemCard(it) {
   del.title = "从磁盘删除这个文件";
   del.onclick = (e) => { e.stopPropagation(); libDelete(it); };
 
+  /* 改名：右下角一个「改」字，点开就把文件名那条换成输入框，就地改 */
+  const ren = document.createElement("button");
+  ren.className = "li-ren";
+  ren.textContent = "改";
+  ren.title = "重命名这个文件（扩展名不变）";
+  ren.onclick = (e) => { e.stopPropagation(); libRename(it, nm); };
+
   el.addEventListener("dragstart", (e) => {
     if (e.target.closest(".li-pick")) { e.preventDefault(); return; }   // 别把勾选拖成拖拽
     e.dataTransfer.setData("application/x-wy-lib", JSON.stringify({
@@ -3489,8 +4585,82 @@ function libItemCard(it) {
     e.dataTransfer.effectAllowed = "copy";
   });
 
-  el.append(th, nm, sz, pick, del);
+  el.append(th, nm, sz, pick, ren, del);
   return el;
+}
+
+/**
+ * 就地改名：文件名那一条换成输入框，扩展名单独当静态后缀摆着。
+ *
+ * 为什么不弹 prompt 输入整串文件名：
+ *   · 整串输入就得自己校验扩展名，手一滑把 .png 写成 .jpg，缩略图立刻认不出来；
+ *   · prompt 是浏览器原生弹窗，跟这套深色界面也不是一路。
+ * 所以只让人改主干名，扩展名由后端保住（`lib_rename` 只改 stem）。
+ * 回车 / 点别处 = 提交，Esc = 放弃。
+ */
+function libRename(it, nmEl) {
+  if (!nmEl || nmEl.querySelector("input")) return;      // 已经在改了
+  const dot = it.name.lastIndexOf(".");
+  const stem = dot > 0 ? it.name.slice(0, dot) : it.name;
+  const ext = dot > 0 ? it.name.slice(dot) : "";
+  const card = nmEl.closest(".lib-item");
+
+  const inp = document.createElement("input");
+  inp.className = "li-name-in";
+  inp.value = stem;
+  inp.spellcheck = false;
+  const sfx = document.createElement("span");
+  sfx.className = "li-name-ext";
+  sfx.textContent = ext;
+
+  nmEl.textContent = "";
+  nmEl.classList.add("editing");
+  nmEl.append(inp, sfx);
+  if (card) card.draggable = false;          // 正在改名，别一动就拖走整张卡
+  inp.focus();
+  inp.select();
+
+  let done = false;
+  const restore = () => {
+    done = true;
+    if (card) card.draggable = true;
+    nmEl.classList.remove("editing");
+    nmEl.textContent = it.name;
+  };
+  const commit = async () => {
+    if (done) return;
+    const v = inp.value.trim();
+    if (!v || v === stem) return restore();   // 没改 / 清空了，当放弃
+    done = true;
+    try {
+      const r = await libReq("/api/lib/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: S.lib.kind, sub: it.sub || "", name: it.name, to: v }),
+      });
+      if (r.unchanged) return restore();
+      /* ComfyUI 的节点里存的是文件名，改完旧名就对不上了 —— 提一句，免得跑的时候才发现 */
+      toast(`已改名：${it.name} → ${r.name}（画布里引用旧名的要重选）`, "ok");
+      /* 勾选状态跟着搬过去，不然批量删会漏掉这个文件 */
+      if (S.lib.sel.delete(libKey(it))) S.lib.sel.add(`${it.sub || ""}|${r.name}`);
+      await libLoadItems();
+    } catch (e) {
+      done = false;                           // 失败留在编辑态，名字还能再改
+      toast("改名失败：" + e.message, "err");
+      inp.focus();
+      inp.select();
+    }
+  };
+
+  inp.onkeydown = (e) => {
+    e.stopPropagation();                      // 别让画布快捷键把回车 / Esc 吃掉
+    if (e.key === "Enter") { e.preventDefault(); commit(); }
+    else if (e.key === "Escape") { e.preventDefault(); restore(); }
+  };
+  inp.onblur = () => commit();
+  inp.onmousedown = (e) => e.stopPropagation();
+  inp.onclick = (e) => e.stopPropagation();
+  inp.ondblclick = (e) => e.stopPropagation();
 }
 
 async function libDelete(it) {
@@ -4045,13 +5215,18 @@ window.__wy = {
   targetType,
   classify,
   buildFields,
+  convertWorkflow,
   cnName,
   computeStages,
   loraCard,
+  setLoraOff,
+  reviveLora,
+  bypassLoraInPrompt,
   grid2,
   libDeleteMany,
   libDeleteProject,
   libDeleteDir,
+  libRename,
   applyDay,
   collectToLib,
   makeCollectBtn,
@@ -4074,8 +5249,19 @@ window.__wy = {
   checkWorkflowStale,
   wfDigest,
   createPulledInput,
+  openWfPicker,
+  chainIntoWorkflow,
+  intakeCandidates,
+  pickIntake,
+  intakeKindsOf,
+  hasDurationParam,
   connectEdge,
   upstreamValue,
+  directorOf,
+  ensureDirectorVideoMode,
+  applyDirectorVideo,
+  patchTimeline,
+  libProbeVideo,
   applyPulled,
   pulledUrl,
   removeNode,

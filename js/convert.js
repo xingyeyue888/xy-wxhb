@@ -171,7 +171,9 @@ export function convertWorkflow(ui, objectInfo) {
 
     if (VALUE_NODE.test(n.type)) {
       const v = Array.isArray(n.widgets_values) ? n.widgets_values[0] : n.widgets_values;
-      return { value: v };
+      /* 记下这个常数是从哪个节点来的：内联之后节点就没了，
+         面板上只剩一个孤零零的数（时长 10.1），没人知道它是「Float (duration)」 */
+      return { value: v, from: n.title || n.type };
     }
     if (n.type === "Reroute") {
       const lk = (n.inputs || [])[0]?.link;
@@ -215,6 +217,8 @@ export function convertWorkflow(ui, objectInfo) {
     if (!info) { missingNodes.push(type); continue; }
 
     const inputs = {};
+    /* 内联常量的来源（输入名 → 原节点标题）：只用于面板显示，不进 API */
+    const inlinedFrom = {};
 
     /* ---- widget 值 ----
        两套数据二选一，绝不混用下标：
@@ -281,9 +285,12 @@ export function convertWorkflow(ui, objectInfo) {
       /* 键名一律用 UI 里的原名：autogrow 输入（values.a）与动态多输入（images.image_1）
          在 API 侧就是扁平点号键，实测 ComfyUI 只认这种形态 */
       inputs[rawName] = val;
+      if (res && typeof res === "object" && res.from) inlinedFrom[rawName] = res.from;
     }
 
-    prompt[String(n.id)] = { class_type: type, inputs, _meta: { title: n.title || type } };
+    const meta = { title: n.title || type };
+    if (Object.keys(inlinedFrom).length) meta.inlined = inlinedFrom;
+    prompt[String(n.id)] = { class_type: type, inputs, _meta: meta };
   }
 
   if (missingNodes.length) {
