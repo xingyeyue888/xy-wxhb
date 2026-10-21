@@ -103,7 +103,7 @@ function init() {
   restore();             // 先恢复画布
   connect();             // 再连 ComfyUI（连上后刷新工作流列表 + 恢复节点）
   /* 每 20 秒问一次工作流文件的修改时间：在 ComfyUI 里改了东西（启用 LoRA 之类），
-     节点头上的 ⟳ 会亮黄点提醒，点一下就能跟上，不用整页刷新 */
+     画布自己读回来跟上，不用整页刷新，也不用再点 ⟳ */
   startStaleWatch();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) checkWorkflowStale(); });
 }
