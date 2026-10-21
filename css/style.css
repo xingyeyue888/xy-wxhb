@@ -545,6 +545,18 @@ html, body {
 }
 .sec-t { flex: 1; min-width: 0; }
 .sec-n { font-size: 10px; color: var(--txt-3); font-weight: 400; }
+/* 标题右边那一小撮（计数 + 可选的「没写回」按钮） */
+.sec-right { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--txt-3); }
+/* LoRA 段标题上「没写回」的小按钮：平时是个数字，对不上时才冒出来 */
+.sec-sync {
+  flex: none; display: inline-flex; align-items: center; gap: 3px;
+  font: inherit; font-size: 9.5px; font-weight: 500; line-height: 1;
+  padding: 3px 6px; border-radius: 5px; cursor: pointer;
+  color: #f0c09a; background: #3a2a22; border: 1px solid #5c4033;
+}
+.sec-sync i { font-style: normal; font-size: 10px; }
+.sec-sync:hover { background: #4a332a; border-color: #7a5340; color: #ffd6b0; }
+.sec-sync:disabled { opacity: .55; cursor: default; }
 .sec.bad .sec-t { color: #e08a6a; }
 .sec.bad .sec-no { background: #4a2a22; color: #f0a88c; }
 .sec-body { display: flex; flex-direction: column; gap: 7px; }

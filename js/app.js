@@ -628,35 +628,24 @@ function adoptWorkflow(node, uiWf, meta) {
   node.syncAt = Date.now();
   node.stale = false;
 
-  /* 停用 / 启用名单也要跟文件对齐，但只对齐「确实在 ComfyUI 里被改过」的那几个：
-     wfModes 是上一次见到文件时的各节点 mode（存在存档里）。
-     · 画布说停用、文件里也是旁路            → 一致，保留
-     · 画布说停用、文件里是启用，上次也是启用  → 画布这边还没写回去（旧存档 / 写盘失败），保留
-     · 画布说停用、文件里是启用，上次是旁路    → 用户在 ComfyUI 里解了旁路，跟着文件走
+  /* 画布上点过的启停，以画布为准，别让文件把它悄悄改回去：
+     · 画布说停用、文件里也是旁路 → 一致
+     · 画布说停用、文件里是启用   → 保留，只标成「没写回」（LoRA 段会亮按钮，点一下补写）
+     以前这里遇到第二种会把画布的状态丢掉「跟着文件走」——问题是 ComfyUI 那边
+     自动保存会把我们写的 mode 盖回去，画布跟着一丢，就成了「点了不启用，过一会儿又自己亮了」。
      画布补出来的加载节点（wy_*）不在文件里，原样留着。 */
   const modes = new Map((uiWf.nodes || []).map(n => [String(n.id), n.mode ?? 0]));
   const prev = node.wfModes || null;
   const ext = new Set((node.extraSlots || []).map(e => e.id));
-  const byp = (m) => m === 4 || m === 2;
-  if (node.assetOff) {
-    node.assetOff = node.assetOff.filter(id => {
-      if (ext.has(id)) return true;
-      if (!modes.has(id)) return false;                       // 工作流里已经没这个节点了
-      if (byp(modes.get(id))) return true;                    // 文件里就是旁路
-      return prev ? !byp(prev[id]) : true;                    // 文件里启用了：上次也启用 = 还没写回，保留
-    });
-  }
-  if (node.assetOn) {
-    node.assetOn = node.assetOn.filter(id => {
-      if (ext.has(id)) return true;
-      if (!modes.has(id)) return false;
-      if (!byp(modes.get(id))) return true;                   // 文件里是启用的
-      return prev ? byp(prev[id]) : true;                     // 文件里旁路：上次也旁路 = 还没写回，保留
-    });
-  }
+  const alive = (id) => ext.has(id) || modes.has(id);
+  if (node.assetOff) node.assetOff = node.assetOff.filter(alive);
+  if (node.assetOn) node.assetOn = node.assetOn.filter(alive);
 
   wireAssetSlots(node);
   rememberModes(node);       // 记下最终 mode（wireAssetSlots 可能把某个节点救回 0）
+  /* 画布上点过启停、文件里却对不上：先记下来，LoRA 段标题上会亮个「没写回」的按钮，
+     不用等下次点一次才发现没同步 */
+  markUnsynced(node, new Map((node.uiWf.nodes || []).map(n => [String(n.id), n.mode ?? 0])));
   return { added, removed, conflicts, dropped, legacy: !prev };}
 
 /** 记下这次见到的各节点 mode，下次同步时用来判断「是谁改的」 */
@@ -707,42 +696,100 @@ async function backupWorkflowOnce(node, snapshot) {
 /**
  * 把画布上的启用 / 停用写回 ComfyUI 的工作流文件
  * 停用 = 节点设成 bypass（mode 4），ComfyUI 里看是紫色旁路，跟手点 bypass 一样
+ *
+ * ⚠️ 写完必须回读一遍再算数：ComfyUI 里要是正开着这份工作流，它浏览器里那份内存副本
+ * 迟早会把自己的版本存回去（Ctrl+S / 自动保存），我们写的 mode 就被抹掉。
+ * 之前只写字不校验，画布上照样弹「已写回」，实际一点没改 —— 这就是「不同步」的来源。
  */
+const LORA_CLOSE_MODE = (m) => m === 4 || m === 2;
 async function pushModesToComfy(node, { quiet = false } = {}) {
   if (!node?.uiWf || node.kind !== "workflow" || !node.file) return { changed: 0 };
   const want = new Map();
   for (const id of node.assetOn || []) want.set(String(id), 0);
   for (const id of node.assetOff || []) want.set(String(id), 4);
-  if (!want.size) return { changed: 0, why: "没有改动" };
+  if (!want.size) { node.unsynced = []; return { changed: 0, why: "没有改动" }; }
+
+  /* 只改 0 / 2 / 4 这几种开关模式，别碰「永远不执行」之类的 */
+  const applyTo = (wf) => {
+    let k = 0;
+    for (const n of wf?.nodes || []) {
+      const m = want.get(String(n.id));
+      if (m === undefined) continue;
+      const cur = n.mode ?? 0;
+      if (cur === m) continue;
+      if (cur !== 0 && cur !== 2 && cur !== 4) continue;
+      n.mode = m;
+      k++;
+    }
+    return k;
+  };
+  /* 回读磁盘：还差哪几个口没落到文件里（文件里本来就没这个节点的跳过，它写不进去） */
+  const readBack = async () => {
+    const wf = await api.getWorkflow(node.file).catch(() => null);
+    if (!wf) return { wf: null, left: [] };
+    const left = [...want.entries()]
+      .filter(([id, m]) => {
+        const x = (wf.nodes || []).find(n => String(n.id) === id);
+        return x && (x.mode ?? 0) !== m;
+      })
+      .map(([id]) => id);
+    return { wf, left };
+  };
 
   const snapshot = JSON.parse(JSON.stringify(node.uiWf));
   const ids = new Set((node.uiWf.nodes || []).map(n => String(n.id)));
   const notInFile = [...want.keys()].filter(id => !ids.has(id)).length;
+  const changed = applyTo(node.uiWf);
 
-  let changed = 0;
-  for (const n of node.uiWf.nodes || []) {
-    const m = want.get(String(n.id));
-    if (m === undefined) continue;
-    const cur = n.mode ?? 0;
-    if (cur === m) continue;
-    if (cur !== 0 && cur !== 2 && cur !== 4) continue;   // 别碰「永远不执行」这类模式
-    n.mode = m;
-    changed++;
-  }
+  /* 内存里已经一致了也别急着说「好了」—— 磁盘上未必，顺手核一下 */
   if (!changed) {
-    if (!quiet) toast(notInFile ? "这个节点是画布补出来的，工作流文件里没有它，没什么可同步" : "ComfyUI 那边已经是这个状态了", "");
-    return { changed: 0, notInFile, why: "已一致" };
+    const { wf, left } = await readBack();
+    if (!left.length) {
+      node.unsynced = [];
+      if (!quiet) toast(notInFile
+        ? "这个节点是画布补出来的，工作流文件里没有它，没什么可同步"
+        : "ComfyUI 那边的文件已经是这个状态了", "");
+      return { changed: 0, notInFile, why: "已一致" };
+    }
+    /* 磁盘没跟上：接着往下写，以磁盘那份为底，别把别人这期间改的别的东西抹掉 */
+    if (wf) node.uiWf = { ...wf, nodes: wf.nodes.map(n => {
+      const m = want.get(String(n.id));
+      return m !== undefined && [0, 2, 4].includes(n.mode ?? 0) ? { ...n, mode: m } : n;
+    }) };
   }
+
   try {
     await backupWorkflowOnce(node, snapshot);
     await api.saveWorkflow(node.file, node.uiWf);
+    let { left } = await readBack();
+    let retried = false;
+    if (left.length) {
+      /* 被挤掉了 → 再补写一次（多半是 ComfyUI 那一页开着，存了自己的版本回去） */
+      retried = true;
+      await api.saveWorkflow(node.file, node.uiWf);
+      left = (await readBack()).left;
+    }
     node.wfSig = wfDigest(node.uiWf);
     rememberModes(node);
     const meta = await api.getWorkflowMeta(node.file).catch(() => null);
     if (meta?.mtime) node.fileMtime = meta.mtime;
     node.stale = false;
-    if (!quiet) toast(`已写回 ComfyUI：「${node.name}」${changed} 个节点启停已更新`, "ok", 4200);
-    return { changed, notInFile };
+    markUnsynced(node, new Map((node.uiWf.nodes || []).map(n => [String(n.id), n.mode ?? 0])));
+    if (left.length) {
+      /* 磁盘就是不听话：说清楚，别让画布顶着「已写回」骗人 */
+      node.unsynced = left;
+      const msg = "写回被挤掉了：ComfyUI 里要是正开着这份工作流，它会把内存里那份存回来盖掉。"
+        + "关掉 ComfyUI 那一页（或先别在那儿保存）再点一次。";
+      toast(msg, "err", 8000);
+      renderNode(node); paintStatus(node);
+      return { changed, notInFile, error: msg, left, retried };
+    }
+    if (!quiet) {
+      const n = changed || want.size;
+      toast(`已写回 ComfyUI：「${node.name}」${n} 个节点启停已更新${retried ? "（被挤掉后补写了一次）" : ""}`, "ok", 4200);
+    }
+    renderNode(node); paintStatus(node);
+    return { changed: changed || want.size, notInFile, retried };
   } catch (e) {
     /* 写盘失败：把内存里改过的 mode 还原，别让画布以为已经同步了 */
     const byId = new Map((snapshot.nodes || []).map(n => [String(n.id), n]));
@@ -751,8 +798,25 @@ async function pushModesToComfy(node, { quiet = false } = {}) {
       if (old && (old.mode ?? 0) !== (n.mode ?? 0)) n.mode = old.mode ?? 0;
     }
     toast(`写回 ComfyUI 失败：${e.message}`, "err", 6000);
+    node.unsynced = [...want.keys()];
+    renderNode(node); paintStatus(node);          // 让 LoRA 段亮出「没写回」，别静悄悄
     return { changed: 0, error: e.message };
   }
+}
+
+/** 画布上明确点过启停的口，跟文件里实际的对不上 → 记进 node.unsynced，LoRA 段会亮「没写回」 */
+function markUnsynced(node, modes) {
+  const bad = [];
+  for (const id of node.assetOff || []) {
+    const m = modes.get(String(id));
+    if (m !== undefined && !LORA_CLOSE_MODE(m)) bad.push(String(id));
+  }
+  for (const id of node.assetOn || []) {
+    const m = modes.get(String(id));
+    if (m !== undefined && LORA_CLOSE_MODE(m)) bad.push(String(id));
+  }
+  node.unsynced = bad;
+  return bad;
 }
 
 /** 定时问一下文件头：ComfyUI 那边改了，就在节点头上亮个黄点 */
@@ -763,19 +827,74 @@ function startStaleWatch() {
 }
 async function checkWorkflowStale() {
   if (document.hidden || !S.oi) return;
-  const nodes = S.nodes.filter(n => n.kind === "workflow" && n.file);
+  const nodes = S.nodes.filter(n => n.kind === "workflow" && n.file && n.status !== "running");
   if (!nodes.length) return;
   await Promise.all(nodes.map(async (n) => {
     try {
       const m = await api.getWorkflowMeta(n.file);
       if (!m.mtime) return;
       if (!n.fileMtime) { n.fileMtime = m.mtime; return; }
-      if (m.mtime > n.fileMtime + 1200 && !n.stale) {
-        n.stale = true;
-        paintStatus(n);
-      }
+      if (m.mtime <= n.fileMtime + 1200) return;
+      /* 文件被改过了：读回来跟画布上的比一比，真变了就跟上。
+         以前这里只亮个黄点等人点 ⟳ —— 在 ComfyUI 里启停个 LoRA，
+         画布一直显示旧的，看着就像「没同步」 */
+      await followComfyChanges(n);
     } catch { }
   }));
+}
+
+/** LoRA 节点在提示里怎么称呼（文件名去掉后缀 / 自定义标题） */
+function loraNameOf(n) {
+  const v = Array.isArray(n?.widgets_values) ? n.widgets_values[0]
+    : n?.widgets_values_named?.lora_name;
+  const clean = typeof v === "string" ? v.replace(/\.[^.\\/]+$/, "").split(/[\\/]/).pop() : "";
+  return n?.title || clean || String(n?.type || "LoRA");
+}
+
+/**
+ * ComfyUI 那边动过这个工作流（启停 LoRA / 改参数 / 增删节点）→ 读回来照着变。
+ * 正在这个节点上打字就只亮黄点，别把人手里的输入框冲掉。
+ */
+async function followComfyChanges(node) {
+  const el = nodeEl(node);
+  if (el && el.contains(document.activeElement)) { node.stale = true; paintStatus(node); return false; }
+  let uiWf, meta;
+  try {
+    [uiWf, meta] = await Promise.all([
+      api.getWorkflow(node.file),
+      api.getWorkflowMeta(node.file).catch(() => null),
+    ]);
+  } catch { return false; }
+  if (meta?.mtime) node.fileMtime = meta.mtime;      // 读成功了才记，失败下次轮询接着试
+  if (wfDigest(uiWf) === node.wfSig) { node.stale = false; paintStatus(node); return false; }
+
+  /* 先看出是哪几个 LoRA 被启停过 —— 这才是最想说清的一件事 */
+  const prevModes = node.wfModes || {};
+  const loraBits = [];
+  for (const n of uiWf.nodes || []) {
+    if (!/lora/i.test(String(n.type || ""))) continue;
+    const id = String(n.id);
+    const before = prevModes[id];
+    const now = n.mode ?? 0;
+    if (before === undefined || before === now) continue;
+    loraBits.push(`${loraNameOf(n)} ${LORA_CLOSE_MODE(now) ? "已停用" : "已启用"}`);
+  }
+
+  let r;
+  try { r = adoptWorkflow(node, uiWf, meta); } catch { return false; }
+  renderNode(node);
+  save();
+
+  const bits = [];
+  if (loraBits.length) {
+    bits.push(loraBits.slice(0, 2).join("、") + (loraBits.length > 2 ? ` 等 ${loraBits.length} 个 LoRA` : ""));
+  }
+  if (r.added) bits.push(`+${r.added} 节点`);
+  if (r.removed) bits.push(`-${r.removed} 节点`);
+  if (r.conflicts.length) bits.push(`${r.conflicts.length} 个参数按 ComfyUI 更新`);
+  if (node.unsynced?.length) bits.push(`${node.unsynced.length} 项画布状态还没写进 ComfyUI`);
+  toast(`「${node.name}」已跟上 ComfyUI${bits.length ? "：" + bits.join("，") : ""}`, "ok", 5200);
+  return true;
 }
 
 /** 节点上最终生效的参数值 = 工作流原值 + 用户在面板上改过的 */
@@ -1922,7 +2041,7 @@ function setAssetOff(node, loaderId, off) {
   if (!syncCfg.push) { toast(base, off ? "" : "ok"); return; }
   pushModesToComfy(node, { quiet: true }).then(r => {
     if (r.error) return;                                   // 失败已在里面报过
-    if (r.changed) toast(`${base} · 已写回 ComfyUI（${r.changed} 个节点）`, off ? "" : "ok", 4000);
+    if (r.changed) toast(`${base} · 已写回 ComfyUI 文件（${r.changed} 个节点）；ComfyUI 里正开着这份工作流的话，重新打开一次才看得到`, off ? "" : "ok", 5200);
     else if (r.notInFile) toast(`${base} · 这是画布补出来的素材，ComfyUI 文件里没有它`, "", 4200);
     else toast(`${base} · ComfyUI 那边已是一致状态`, off ? "" : "ok");
   });
@@ -2055,7 +2174,7 @@ function setLoraOff(node, loraId, off) {
   if (!syncCfg.push) { toast(base, off ? "" : "ok"); return; }
   pushModesToComfy(node, { quiet: true }).then(r => {
     if (r.error) return;
-    if (r.changed) toast(`${base} · 已写回 ComfyUI（${r.changed} 个节点）`, off ? "" : "ok", 4000);
+    if (r.changed) toast(`${base} · 已写回 ComfyUI 文件（${r.changed} 个节点）；ComfyUI 里正开着这份工作流的话，重新打开一次才看得到`, off ? "" : "ok", 5200);
     else if (r.notInFile) toast(`${base} · 这是画布补出来的节点，ComfyUI 文件里没有它`, "", 4200);
     else toast(`${base} · ComfyUI 那边已是一致状态`, off ? "" : "ok");
   });
@@ -2817,7 +2936,13 @@ function renderNode(node) {
        现在补成「已停用」的卡：看得见、点得到启用，不用回 ComfyUI 按 Ctrl+B */
     const dormant = dormantLoras(node);
     if (loraOrder.length || dormant.length) {
-      const box = sectionBox(++secNo, "LoRA", loraOrder.length + dormant.length, false);
+      /* 标题右边：先摆「几个 LoRA」，对不上时再挂一颗「没写回」的按钮 */
+      const right = document.createElement("span");
+      right.className = "sec-right";
+      right.appendChild(document.createTextNode(String(loraOrder.length + dormant.length)));
+      const chip = loraSyncChip(node);
+      if (chip) right.appendChild(chip);
+      const box = sectionBox(++secNo, "LoRA", right, false);
       const sb = box.querySelector(".sec-body");
       /* 一采、二采各挂一整套 LoRA 时（导演台那种），标题必须写清楚是哪一道 */
       const stages = loraOrder.map(id => stg.get(String(id)) || 0);
@@ -2855,13 +2980,16 @@ function renderNode(node) {
   view.scheduleEdges();
 }
 
-/** 工作流节点里带编号的一节 */
+/** 工作流节点里带编号的一节。right 可以是一个元素（塞按钮进来），也可以是一段文字 */
 function sectionBox(no, title, right, bad) {
   const box = document.createElement("div");
   box.className = "sec" + (bad ? " bad" : "");
   box.innerHTML = `<div class="sec-head"><span class="sec-no">${no}</span>
-    <span class="sec-t">${esc(title)}</span><span class="sec-n">${esc(String(right ?? ""))}</span></div>
+    <span class="sec-t">${esc(title)}</span><span class="sec-n"></span></div>
     <div class="sec-body"></div>`;
+  const slot = box.querySelector(".sec-n");
+  if (right instanceof Node) slot.replaceWith(right);
+  else slot.textContent = String(right ?? "");
   return box;
 }
 
@@ -2878,6 +3006,27 @@ function grid2(items) {
  * 以前「LoRA 名」进模型区、「强度」被 strength 规则抓进参数区，两边分家，
  * 一排 5 个 LoRA 配 5 个强度，谁配谁全靠猜。
  */
+/**
+ * LoRA 段标题右边的小按钮：画布上点过启停、但 ComfyUI 文件里还没落地的项
+ * 平时不显示（正常显示的是「几个 LoRA」），对不上时才冒出来，点一下重推
+ */
+function loraSyncChip(node) {
+  const bad = (node.unsynced || []).length;
+  if (!bad) return null;
+  const b = document.createElement("button");
+  b.className = "sec-sync";
+  b.innerHTML = `<i>⇅</i>${bad} 项没写回`;
+  b.title = "画布上的启停状态和 ComfyUI 的工作流文件对不上。\n"
+    + "常见原因：ComfyUI 里正开着这份工作流，它把自己内存里的版本存回去盖掉了我们写的。\n"
+    + "关掉 ComfyUI 那一页（或先别在那边保存）再点这里。";
+  b.onclick = (e) => {
+    e.stopPropagation();
+    b.disabled = true;
+    pushModesToComfy(node);
+  };
+  return b;
+}
+
 function loraCard(node, fs, idx, pass) {
   const id = fs[0]?.nodeId;
   const nd = node.prompt[id] || {};
@@ -5246,6 +5395,10 @@ window.__wy = {
   lockMapOf,
   syncFromComfy,
   pushModesToComfy,
+  followComfyChanges,
+  markUnsynced,
+  loraSyncChip,
+  loraNameOf,
   checkWorkflowStale,
   wfDigest,
   createPulledInput,
