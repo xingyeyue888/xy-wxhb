@@ -107,17 +107,26 @@ def main():
     exec_names = {"start.sh"}
     total = 0
 
+    # 固定时间戳 → 同一份源码每次打出来的 zip 逐字节相同（SHA256 可复现），
+    # 否则每个条目带着各自的 mtime，连打两次校验和都不一样，没法对账
+    STAMP = (1980, 1, 1, 0, 0, 0)
+
+    def entry(name, mode):
+        info = zipfile.ZipInfo(name, date_time=STAMP)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = mode << 16
+        info.create_system = 3          # 标成 Unix，解压端才认权限位
+        return info
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for full, rel in items:
             total += os.path.getsize(full)
-            info = zipfile.ZipInfo.from_file(full, "%s/%s" % (top, rel))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (0o755 if rel in exec_names else 0o644) << 16
+            info = entry("%s/%s" % (top, rel), 0o755 if rel in exec_names else 0o644)
             with open(full, "rb") as src, z.open(info, "w") as dst:
                 dst.write(src.read())
 
         # 解压后一眼能看懂的落地说明
-        z.writestr("%s/包内说明.txt" % top, (
+        z.writestr(entry("%s/包内说明.txt" % top, 0o644), (
             "wy-canvas v%s\r\n"
             "\r\n"
             "1. 先把 ComfyUI 跑起来（默认 http://127.0.0.1:8188）\r\n"
