@@ -278,16 +278,17 @@ export class CanvasView {
 
   /* ---------------- 交互 ---------------- */
   _bind() {
-    /* 滚轮缩放。
-       但鼠标停在「内容能滚的节点」上时要先滚内容 —— 节点被拉矮之后
-       正文区就是滚动容器，这时候还继续缩放，等于滚一下放大一下，没法看 */
+    /* 滚轮：
+       · 节点内部 —— 只滚节点自己的内容。滚到顶 / 到底就停住，不再顺势把画布放大缩小
+         （以前滚到底再滚一下，整个画布「唰」地缩放，手一滑就找不到自己刚才在看哪儿）
+       · 节点外部空白画布 —— 滚轮缩放
+       · 想在哪都能缩放：按住 Ctrl / ⌘ 滚滚轮（触控板捏合同样走这条） */
     this.stage.addEventListener("wheel", (e) => {
-      const sc = this._scrollableUnder(e.target);
-      if (sc) {
-        const down = e.deltaY > 0;
-        const atTop = sc.scrollTop <= 0;
-        const atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 1;
-        if (!(down && atBottom) && !(!down && atTop)) return;   // 还有内容可滚，交给它
+      const mod = e.ctrlKey || e.metaKey;
+      /* 节点里：有得滚就交给它滚（到底了它自己会停），没得滚就什么都不做 */
+      if (!mod && e.target?.closest?.(".node")) {
+        if (!this._scrollableUnder(e.target)) e.preventDefault();
+        return;
       }
       e.preventDefault();
       const f = Math.pow(1.0015, -e.deltaY);
@@ -346,12 +347,23 @@ export class CanvasView {
     });
   }
 
-  /** 指针底下「纵向能滚」的节点内容区（只认 .node-body，别抢输入框自己的滚动） */
+  /**
+   * 鼠标下面最近的一个「竖向能滚」的元素（且必须在节点里）。
+   * 不只看 .node-body —— 提示词文本框、素材胶囊、下拉列表这些自己也能滚，
+   * 滚它们的时候同样不该被画布顺手缩放。
+   */
   _scrollableUnder(el) {
-    const body = el?.closest?.(".node-body");
-    if (!body) return null;
-    const ov = getComputedStyle(body).overflowY;
-    if ((ov === "auto" || ov === "scroll") && body.scrollHeight > body.clientHeight + 1) return body;
+    for (let x = el; x && x !== this.stage; x = x.parentElement) {
+      /* 走到节点外面就收手：画布本身的滚动不算数 */
+      if (!x.closest?.(".node")) break;
+      const cs = getComputedStyle(x);
+      const oy = cs.overflowY;
+      const canScrollY = oy === "auto" || oy === "scroll" || oy === "overlay";
+      const canScrollX = cs.overflowX === "auto" || cs.overflowX === "scroll";
+      const over = canScrollY && x.scrollHeight > x.clientHeight + 1
+        || canScrollX && x.scrollWidth > x.clientWidth + 1;
+      if (over) return x;
+    }
     return null;
   }
 
