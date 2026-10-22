@@ -105,7 +105,13 @@ function init() {
   /* 每 20 秒问一次工作流文件的修改时间：在 ComfyUI 里改了东西（启用 LoRA 之类），
      画布自己读回来跟上，不用整页刷新，也不用再点 ⟳ */
   startStaleWatch();
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) checkWorkflowStale(); });
+  document.addEventListener("visibilitychange", () => {
+    /* 切去别的标签页 → 攒着的改动立刻落地，别等停手 3 秒 */
+    if (document.hidden) flushPendingPushes();
+    else checkWorkflowStale();
+  });
+  window.addEventListener("pagehide", () => flushPendingPushes());
+  bindAutoPushOnClickAway();
 }
 
 /* ==================================================================
@@ -811,13 +817,19 @@ async function pushModesToComfy(node, { quiet = false } = {}) {
    同一份工作流还是旧值 —— 同一份工作流两个版本，跑出来当然对不上。
    现在画布上能改的（参数、采样器、模型、LoRA、素材文件、提示词）全都往回写。
 
-   三条规矩：
-   · 按节点攒 700ms 一起写 —— 拖 spinner、连着敲提示词时不会每一下都落盘
+   四条规矩：
+   · 按节点攒批一起写 —— 拖 spinner、连着敲提示词时不会每一下都落盘
+   · 打字类（数字框 / 文本 / 提示词）停手 3 秒自动写，连打不断也不超过 3 秒；
+     下拉、勾选这类一次到位的控件 0.7 秒就写
+   · 点输入框以外的地方、切走窗口、按回车 —— 一律立刻写，不用等那 3 秒
    · 以磁盘那份为底再改字段 —— ComfyUI 那页可能刚存过，拿内存里的旧版整个盖回去
      会把人家的改动吃掉
    · 写完回读校验，被盖掉就补写一次；还不对就把话说明白，不假装成功
 ================================================================== */
-const PUSH_DEBOUNCE = 700;
+const PUSH_DEBOUNCE = 700;         // 下拉 / 勾选 / 换素材：一次到位，短攒一下就写
+const PUSH_TYPING_MS = 3000;       // 打字：停手 3 秒自动写回
+const PUSH_TYPING_MAX = 3000;      // 一直打个不停时，从这轮第一下算起最多憋 3 秒
+const pushFirstAt = new Map();     // 画布节点 id → 这一轮第一下改动的时间
 const pushQueue = new Map();       // 画布节点 id → Map("nodeId|field" → {nid, field, value})
 const pushTimers = new Map();
 
@@ -886,19 +898,68 @@ function pushToast(node, text, kind) {
   toast(text, kind, 2600);
 }
 
-/** 记一笔「画布上改了，待写回」。攒到 700ms 没新动静才真正落盘 */
-function queueParamPush(node, nid, field, value) {
+/** 记一笔「画布上改了，待写回」。打字类停手 3 秒写，其它控件 0.7 秒写。
+ *  typing=true 表示这是「正在打字」的改动（数字框每敲一下、文本框每输一个字） */
+function queueParamPush(node, nid, field, value, typing) {
   if (!syncCfg.push || node?.kind !== "workflow" || !node.file) return;
   if (nid === undefined || nid === null || !field || value === undefined) return;
   const k = String(nid) + "|" + field;
   let q = pushQueue.get(node.id);
   if (!q) { q = new Map(); pushQueue.set(node.id, q); }
   q.set(k, { nid: String(nid), field, value });
+
+  const now = Date.now();
+  let wait = typing ? PUSH_TYPING_MS : PUSH_DEBOUNCE;
+  if (typing) {
+    /* 连着打不停的话，看这一轮第一下是什么时候 —— 保证 3 秒内一定写一次 */
+    const first = pushFirstAt.get(node.id) || now;
+    pushFirstAt.set(node.id, first);
+    wait = Math.max(0, Math.min(wait, PUSH_TYPING_MAX - (now - first)));
+  }
   clearTimeout(pushTimers.get(node.id));
   pushTimers.set(node.id, setTimeout(() => {
     pushTimers.delete(node.id);
+    pushFirstAt.delete(node.id);
     flushParamPush(node).catch(() => { });
-  }, PUSH_DEBOUNCE));
+  }, wait));
+}
+
+/** 不等攒批，马上把这个节点攒着的改动写掉（回车、失焦、点别处都走这里） */
+function flushNodePush(node) {
+  if (!node) return;
+  clearTimeout(pushTimers.get(node.id));
+  pushTimers.delete(node.id);
+  pushFirstAt.delete(node.id);
+  flushParamPush(node).catch(() => { });
+}
+
+/** 所有节点攒着的改动一起写（点空白、切走窗口、开始运行之前） */
+function flushPendingPushes() {
+  for (const id of [...pushQueue.keys()]) {
+    clearTimeout(pushTimers.get(id));
+    pushTimers.delete(id);
+    pushFirstAt.delete(id);
+    const n = S.nodes.find(x => x.id === id);
+    if (n) flushParamPush(n).catch(() => { });
+  }
+}
+
+/* 点到输入框以外的地方就写回。
+   光靠 blur / change 是不够的 —— 画布按下空白处会 preventDefault（为了拖动画布），
+   焦点压根没挪走，change 事件也就不会来，于是「非得敲回车才同步」。
+   这里先手动失焦让 change 落地，再把攒着的改动一次写掉。 */
+let _clickAwayBound = false;
+function bindAutoPushOnClickAway() {
+  if (_clickAwayBound) return;
+  _clickAwayBound = true;
+  document.addEventListener("pointerdown", (e) => {
+    const t = e.target;
+    const inField = !!t?.closest?.("input, textarea, select, [contenteditable]");
+    if (inField) return;                       // 点到另一个格子上：让它的 blur 自己收尾
+    const ae = document.activeElement;
+    if (ae && ae !== t && ae.matches?.("input, textarea, select, [contenteditable]")) ae.blur();
+    flushPendingPushes();
+  }, true);
 }
 
 /**
@@ -997,7 +1058,7 @@ async function flushParamPushInner(node, items) {
 }
 
 /** 文本节点的内容 → 它连着的那些工作流输入口（提示词就是这么同步进 ComfyUI 的） */
-function queueTextPush(node) {
+function queueTextPush(node, typing) {
   if (!syncCfg.push || node?.kind !== "input" || node.inKind !== "text") return;
   const text = node.value ?? "";
   for (const e of S.edges || []) {
@@ -1006,7 +1067,7 @@ function queueTextPush(node) {
     if (!t || t.kind !== "workflow") continue;
     const bar = String(e.key).lastIndexOf("|");
     if (bar < 0) continue;
-    queueParamPush(t, e.key.slice(0, bar), e.key.slice(bar + 1), text);
+    queueParamPush(t, e.key.slice(0, bar), e.key.slice(bar + 1), text, typing);
   }
 }
 
@@ -1806,7 +1867,7 @@ function fieldControl(f, node, opt) {
     return wrap;
   }
 
-  const commit = (v) => {
+  const commit = (v, typing) => {
     node.params[f.key] = v;
     const m = missOf(f, v);
     wrap.classList.toggle("missing", m);
@@ -1820,8 +1881,10 @@ function fieldControl(f, node, opt) {
     scheduleSave();
     /* 改了哪一格就同步哪一格：参数、采样器、模型、LoRA 强度、提示词，一个不落。
        不写回的话，从 ComfyUI 界面跑同一份工作流用的还是文件里那个旧值 */
-    queueParamPush(node, f.nodeId, f.name, v);
+    queueParamPush(node, f.nodeId, f.name, v, typing);
   };
+  /* 失焦（点去别处 / Tab 走）就立刻写，别让人非得敲一下回车 */
+  const onBlur = () => flushNodePush(node);
 
   if (Array.isArray(f.choices) && f.choices.length) {
     const sel = document.createElement("select");
@@ -1842,17 +1905,20 @@ function fieldControl(f, node, opt) {
       sel.appendChild(op);
     }
     sel.onchange = () => commit(sel.value);
+    sel.onblur = onBlur;
     wrap.appendChild(sel);
   } else if (f.type === "BOOLEAN") {
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = !!cur;
     cb.onchange = () => commit(cb.checked);
+    cb.onblur = onBlur;
     wrap.appendChild(cb);
   } else if (cls === "main" || (typeof cur === "string" && cur.length > 60)) {
     const ta = document.createElement("textarea");
     ta.value = cur ?? "";
     ta.rows = Math.min(6, Math.max(3, Math.ceil(String(cur ?? "").length / 42)));
-    ta.oninput = () => commit(ta.value);
+    ta.oninput = () => commit(ta.value, true);
+    ta.onblur = onBlur;
     wrap.appendChild(ta);
   } else if (f.type === "INT" || f.type === "FLOAT") {
     const inp = document.createElement("input");
@@ -1863,13 +1929,24 @@ function fieldControl(f, node, opt) {
     /* 浮点尾巴太脏（0.7000000000000002）—— 只修显，不动实际值 */
     inp.value = typeof cur === "number" && !Number.isInteger(cur)
       ? String(parseFloat(cur.toFixed(6))) : (cur ?? 0);
-    inp.onchange = () => commit(f.type === "INT" ? parseInt(inp.value || 0, 10) : parseFloat(inp.value || 0));
+    const readNum = () => {
+      const raw = String(inp.value ?? "").trim();
+      if (raw === "") return undefined;                  // 正在删空，先别写个 0 出去
+      const v = f.type === "INT" ? parseInt(raw, 10) : parseFloat(raw);
+      return Number.isFinite(v) ? v : undefined;         // 「-」「1.」这种半截先不管
+    };
+    /* 边敲边记：敲完不用回车，停手 3 秒自己写回 ComfyUI */
+    inp.oninput = () => { const v = readNum(); if (v !== undefined) commit(v, true); };
+    inp.onchange = () => { const v = readNum(); if (v !== undefined) commit(v); flushNodePush(node); };
+    inp.onblur = onBlur;
     wrap.appendChild(inp);
   } else {
     const inp = document.createElement("input");
     inp.type = "text";
     inp.value = cur ?? "";
-    inp.oninput = () => commit(inp.value);
+    inp.oninput = () => commit(inp.value, true);
+    inp.onchange = () => commit(inp.value);
+    inp.onblur = onBlur;
     wrap.appendChild(inp);
   }
 
@@ -2723,8 +2800,10 @@ function renderInputBody(node, el) {
       node.value = ta.value;
       scheduleSave();
       paintStatus(node);
-      queueTextPush(node);        // 接在工作流提示词口上的，顺带写回 ComfyUI
+      queueTextPush(node, true);  // 接在工作流提示词口上的，顺带写回 ComfyUI（停手 3 秒自动写）
     };
+    /* 一点别处就立刻写，不用等那 3 秒 */
+    ta.onblur = () => { queueTextPush(node); flushPendingPushes(); };
     body.appendChild(ta);
     return;
   }
@@ -5694,6 +5773,8 @@ window.__xy = {
   checkWorkflowStale,
   queueParamPush,
   flushParamPush,
+  flushNodePush,
+  flushPendingPushes,
   queueTextPush,
   readUiWidget,
   setUiWidget,
