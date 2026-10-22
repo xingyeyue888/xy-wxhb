@@ -689,7 +689,8 @@ async function backupWorkflowOnce(node, snapshot) {
   const d = new Date();
   const p2 = (n) => String(n).padStart(2, "0");
   const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
-  await api.putUserFile(`wy-canvas-backup/${safe}.${stamp}.json`, JSON.stringify(snapshot, null, 2));
+  /* 备份也用紧凑 JSON：跟 ComfyUI 自己存的排版一致，回滚时格式不打架 */
+  await api.putUserFile(`wy-canvas-backup/${safe}.${stamp}.json`, JSON.stringify(snapshot));
   backedUp.add(node.file);
 }
 

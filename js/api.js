@@ -81,12 +81,17 @@ export async function getWorkflowMeta(relPath) {
   return { mtime: Number.isFinite(t) ? t : 0, etag: res.headers.get("Etag") || "" };
 }
 
-/** 写回工作流文件（把画布上的启停状态同步给 ComfyUI） */
+/**
+ * 写回工作流文件（把画布上的启停 / LoRA 参数同步给 ComfyUI）。
+ * 排版跟 ComfyUI 自己存的一致：单行紧凑 JSON，不缩进。
+ * 以前这里用 2 空格缩进，同一个文件被画布存一次就 84 KB → 144 KB、
+ * ComfyUI 存一次又缩回去，两边来回跳（内容等价，只是排版打架）。
+ */
 export async function saveWorkflow(relPath, obj) {
   return req(wfPath(relPath), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(obj, null, 2),
+    body: JSON.stringify(obj),
     cache: "no-store",
   }, 30000);
 }
