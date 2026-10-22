@@ -23,6 +23,8 @@ export class CanvasView {
     this.edgesEl = edgesEl;
     this.nodes = new Map();          // id -> {el, x, y, w, h}
     this.edges = [];                 // [{from, to, key}]
+    this._edgeEls = new Map();       // "from|to|key" -> {el, base, glow, flow, d}
+    this._temp = null;               // 拖线时的临时曲线
     this._raf = null;
     this.view = { x: 0, y: 0, k: 1 };
     this.selected = new Set();
@@ -79,16 +81,63 @@ export class CanvasView {
     for (const p of document.querySelectorAll(".node .port")) {
       if (p.dataset.port && this._portVisible(p)) ports.set(p.dataset.port, p);
     }
-    let html = "";
+    /* 拖线结束就撤掉那根跟随鼠标的曲线 */
+    if (this._temp) { this._temp.remove(); this._temp = null; }
+
+    const seen = new Set();
     for (const e of this.edges || []) {
       const a = ports.get("out:" + e.from);
       const b = ports.get("in:" + e.to + (e.key ? ":" + e.key : ""));
       if (!a || !b) continue;
+      const key = e.from + "|" + e.to + "|" + (e.key || "");
+      seen.add(key);
       const p1 = this.portWorld(a), p2 = this.portWorld(b);
       const dx = Math.max(50, Math.abs(p2.x - p1.x) * 0.45);
-      html += `<path vector-effect="non-scaling-stroke" d="M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}"/>`;
+      const d = `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`;
+      /* 线元素复用，不整块重建 innerHTML —— 重建会让流光的动画每帧从头开始，
+         拖动 / 缩放的时候看着就像卡住的虚线。 */
+      let g = this._edgeEls.get(key);
+      if (!g) {
+        g = this._makeEdgeEls();
+        this._edgeEls.set(key, g);
+      }
+      if (g.d !== d) {
+        g.base.setAttribute("d", d);
+        g.glow.setAttribute("d", d);
+        g.flow.setAttribute("d", d);
+        g.d = d;
+      }
     }
-    svg.innerHTML = html;
+    /* 删掉已经不存在的线 */
+    for (const [k, g] of this._edgeEls) {
+      if (seen.has(k)) continue;
+      g.el.remove();
+      this._edgeEls.delete(k);
+    }
+  }
+
+  /** 一根线 = 底线 + 流光光晕 + 流光芯（同一段 dash，靠 CSS 动画往前跑） */
+  _makeEdgeEls() {
+    const NS = "http://www.w3.org/2000/svg";
+    const mk = (cls, extra = {}) => {
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("class", cls);
+      for (const [k, v] of Object.entries(extra)) p.setAttribute(k, v);
+      return p;
+    };
+    const el = document.createElementNS(NS, "g");
+    el.setAttribute("class", "edge");
+    const base = mk("edge-base", { "vector-effect": "non-scaling-stroke" });
+    /* pathLength=100：dash 按「整条线的百分比」算，线的长短不一也不会有的跑得快有的慢 */
+    const glow = mk("edge-glow", { pathLength: "100" });
+    const flow = mk("edge-flow", { pathLength: "100" });
+    /* 错开相位，一堆线不会同步闪 */
+    const delay = (-Math.random() * 2.6).toFixed(2) + "s";
+    glow.style.animationDelay = delay;
+    flow.style.animationDelay = delay;
+    el.append(base, glow, flow);
+    this.edgesEl.appendChild(el);
+    return { el, base, glow, flow, d: "" };
   }
 
   /**
@@ -119,8 +168,14 @@ export class CanvasView {
     const k = this.view.k;
     const p2 = { x: (clientX - s.left - this.view.x) / k, y: (clientY - s.top - this.view.y) / k };
     const dx = Math.max(50, Math.abs(p2.x - p1.x) * 0.45);
-    svg.innerHTML = `<path vector-effect="non-scaling-stroke" class="active"
-      d="M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}"/>`;
+    if (!this._temp) {
+      this._temp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      this._temp.setAttribute("class", "temp");
+      this._temp.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(this._temp);
+    }
+    this._temp.setAttribute("d",
+      `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`);
   }
 
 

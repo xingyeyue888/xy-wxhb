@@ -404,11 +404,26 @@ html, body {
   will-change: transform;
 }
 
-.edges { position: absolute; overflow: visible; pointer-events: none; width: 1px; height: 1px; }
-.edges path { fill: none; stroke: var(--line-2); stroke-width: 2; }
-.edges path.active { stroke: var(--accent); }
+/* 线画在节点上层：素材接到哪一格要一眼看得见，被节点压住就只看到「有线」看不出「接哪儿」。
+   线本身 pointer-events: none，不会挡掉节点的点击和拖拽 */
+.edges { position: absolute; overflow: visible; pointer-events: none; width: 1px; height: 1px; z-index: 3; }
+.edge-base { fill: none; stroke: var(--line-2); stroke-width: 2; }
+.edges path.temp { fill: none; stroke: var(--accent); stroke-width: 2; }
 
-.nodes { position: absolute; top: 0; left: 0; }
+/* 数据流动的光效：一段 dash 从头跑到尾（pathLength=100，所以线长线短都是同一节奏）
+   光晕 + 亮芯两条叠着，不用 filter，几十根线也不掉帧 */
+.edge-glow, .edge-flow { fill: none; stroke-linecap: round; stroke-dasharray: 7 93; }
+.edge-glow {
+  stroke: var(--accent); stroke-width: 6.5; opacity: .22;
+  animation: edgeFlow 2.6s linear infinite;
+}
+.edge-flow {
+  stroke: #bcd4ff; stroke-width: 1.8; opacity: .95;
+  animation: edgeFlow 2.6s linear infinite;
+}
+@keyframes edgeFlow { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -100; } }
+
+.nodes { position: absolute; top: 0; left: 0; z-index: 1; }
 
 /* ============ 节点 ============ */
 .node {
@@ -953,9 +968,10 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 .empty-tip.hide { display: none; }
 
 /* ============ Toast ============ */
+/* 提示挂画布中上：右下角那块常常被节点/滚条压着，而且眼睛在看中间 */
 .toast-wrap {
-  position: absolute; right: 14px; bottom: 14px;
-  display: flex; flex-direction: column; gap: 7px; align-items: flex-end;
+  position: absolute; left: 50%; top: 16px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 7px; align-items: center;
   pointer-events: none; z-index: 50;
 }
 .toast {
@@ -967,7 +983,7 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 }
 .toast.err { border-left-color: var(--err); }
 .toast.ok { border-left-color: var(--ok); }
-@keyframes slide { from { opacity: 0; transform: translateY(6px); } }
+@keyframes slide { from { opacity: 0; transform: translateY(-6px); } }
 
 /* ============ 素材槽：一格一图 + 底下按钮（同类型横排） ============ */
 .slot-zone { gap: 10px; }
