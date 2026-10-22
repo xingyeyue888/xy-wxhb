@@ -113,8 +113,25 @@ export async function submit(prompt, clientId = "wy-canvas") {
 
 export const queueState = () => req("/api/queue", {}, 8000);
 
-export async function interrupt() {
-  try { await req("/api/interrupt", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }, 8000); } catch { }
+/**
+ * 中断执行。带上 prompt_id 时只打这一个（新版 ComfyUI 支持；
+ * 老版本会忽略这个字段，退回「中断当前正在跑的」）
+ */
+export async function interrupt(promptId = "") {
+  const body = promptId ? { prompt_id: promptId } : {};
+  try { await req("/api/interrupt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 8000); } catch { }
+}
+
+/** 从排队里撤掉一个还没开始的 prompt（提交完立刻点停止时走这条） */
+export async function deleteQueued(promptId) {
+  if (!promptId) return;
+  try {
+    await req("/api/queue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delete: [promptId] }),
+    }, 8000);
+  } catch { }
 }
 
 /** 轮询一次历史；返回 null 表示还没跑完 */

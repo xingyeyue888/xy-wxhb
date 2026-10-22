@@ -804,6 +804,101 @@ async function pushModesToComfy(node, { quiet = false } = {}) {
   }
 }
 
+/* ---------------- 参数写回：LoRA 强度 / 换模型 ----------------
+   以前只有「启停」会写回文件，强度只在画布内存和提交体里生效：
+   在画布上把 strength 拉到 0，回 ComfyUI 打开那份工作流还是 1.0 ——
+   同一份工作流两个强度，跑出来的东西当然对不上。现在 LoRA 段的改动也往回写。
+================================================================== */
+const paramPushTimers = new Map();
+
+/** 某个 widget 在 widgets_values 数组里的位置（跟 listWidgets 的排法一致） */
+function widgetIndexOfField(cls, field) {
+  const info = S.oi?.[cls];
+  if (!info) return -1;
+  let idx = 0;
+  for (const w of listWidgets(info)) {
+    if (w.name === field) return idx;
+    idx += 1 + (w.extraAfter ? 1 : 0);
+  }
+  return -1;
+}
+
+/** 把 UI 工作流里某个节点的某个参数改成新值（named / 数组两种存法都改） */
+function setUiWidget(nd, cls, field, value) {
+  let hit = false;
+  const named = (nd.widgets_values_named && typeof nd.widgets_values_named === "object") ? nd.widgets_values_named
+    : (!Array.isArray(nd.widgets_values) && nd.widgets_values && typeof nd.widgets_values === "object") ? nd.widgets_values
+      : null;
+  if (named && field in named) { named[field] = value; hit = true; }
+  const arr = Array.isArray(nd.widgets_values) ? nd.widgets_values : null;
+  const i = widgetIndexOfField(cls, field);
+  if (arr && i >= 0 && i < arr.length) { arr[i] = value; hit = true; }
+  return hit;
+}
+
+/** 攒一下再写：拖 spinner 时每一下都落盘会把文件写烂，也容易撞上 ComfyUI 的自动保存 */
+function scheduleLoraPush(node, f, value) {
+  if (!syncCfg.push || node.kind !== "workflow" || !node.file) return;
+  if (!f.nodeId || !f.name) return;
+  const key = node.id + "|" + f.nodeId + "|" + f.name;
+  clearTimeout(paramPushTimers.get(key));
+  paramPushTimers.set(key, setTimeout(() => {
+    paramPushTimers.delete(key);
+    pushParamToComfy(node, f.nodeId, f.name).catch(() => { });
+  }, 650));
+}
+
+/** 把一个参数写回工作流文件，写完回读校验（跟启停同一套规矩：200 不算成功） */
+async function pushParamToComfy(node, nid, field) {
+  if (!node?.uiWf || node.kind !== "workflow" || !node.file) return { skipped: 1 };
+  const want = node.params[String(nid) + "|" + field];
+  if (want === undefined) return { skipped: 1 };
+  const ui = (node.uiWf.nodes || []).find(n => String(n.id) === String(nid));
+  if (!ui) {
+    toast(`「${field}」改的是画布补出来的那份，ComfyUI 的文件里没有这个节点`, "", 4200);
+    return { skipped: 1 };
+  }
+  const snapshot = JSON.parse(JSON.stringify(node.uiWf));
+  if (!setUiWidget(ui, ui.type, field, want)) {
+    toast(`ComfyUI 的工作流里没存着「${field}」这一格，写不进去`, "err", 5000);
+    return { skipped: 1 };
+  }
+  const readBack = async () => {
+    const wf = await api.getWorkflow(node.file).catch(() => null);
+    const nd = (wf?.nodes || []).find(n => String(n.id) === String(nid));
+    if (!nd) return { ok: false, why: "节点不在了" };
+    const named = (nd.widgets_values_named && typeof nd.widgets_values_named === "object") ? nd.widgets_values_named : null;
+    const arr = Array.isArray(nd.widgets_values) ? nd.widgets_values : null;
+    const i = widgetIndexOfField(nd.type, field);
+    const got = named && field in named ? named[field] : (arr && i >= 0 ? arr[i] : undefined);
+    return { ok: sameVal(got, want), got };
+  };
+  try {
+    await backupWorkflowOnce(node, snapshot);
+    await api.saveWorkflow(node.file, node.uiWf);
+    let r = await readBack();
+    if (!r.ok) {
+      /* 被 ComfyUI 那一页盖掉了 → 补写一次再算数 */
+      await api.saveWorkflow(node.file, node.uiWf);
+      r = await readBack();
+    }
+    node.wfSig = wfDigest(node.uiWf);
+    const meta = await api.getWorkflowMeta(node.file).catch(() => null);
+    if (meta?.mtime) node.fileMtime = meta.mtime;
+    node.stale = false;
+    if (!r.ok) {
+      toast(`「${field}」没写回 ComfyUI：文件里还是 ${r.got ?? "（空）"}`
+        + " —— ComfyUI 那边是不是正开着这份工作流？关掉那一页再改一次", "err", 7000);
+      return { error: true };
+    }
+    toast(`已写回 ComfyUI：「${field}」= ${want}`, "ok", 2200);
+    return { ok: true };
+  } catch (e) {
+    toast(`写回 ComfyUI 失败：${e.message}`, "err", 6000);
+    return { error: true };
+  }
+}
+
 /** 画布上明确点过启停的口，跟文件里实际的对不上 → 记进 node.unsynced，LoRA 段会亮「没写回」 */
 function markUnsynced(node, modes) {
   const bad = [];
@@ -1612,6 +1707,9 @@ function fieldControl(f, node, opt) {
       wrap.appendChild(t);
     } else if (!m && tip) tip.remove();
     scheduleSave();
+    /* LoRA 段的强度 / 换模型：画布上改完要落进 ComfyUI 的工作流文件 ——
+       不然从 ComfyUI 界面跑同一份工作流，用的还是文件里那个旧强度 */
+    if (cls === "lora") scheduleLoraPush(node, f, v);
   };
 
   if (Array.isArray(f.choices) && f.choices.length) {
@@ -2441,7 +2539,12 @@ function mountNode(node) {
     el.querySelector(".collapse").textContent = el.querySelector(".node-body").classList.contains("hidden") ? "▸" : "▾";
   };
   const runBtn = el.querySelector(".nbtn.run");
-  if (runBtn) runBtn.onclick = (e) => { e.stopPropagation(); runNode(node); };
+  if (runBtn) runBtn.onclick = (e) => {
+    e.stopPropagation();
+    /* 一个按钮两种身份：空闲时开跑，跑起来就变成「停止」 */
+    if (node.status === "running") stopRun(node);
+    else runNode(node);
+  };
   const syncBtn = el.querySelector(".nbtn.sync");
   if (syncBtn) syncBtn.onclick = (e) => { e.stopPropagation(); syncFromComfy(node); };
   renderNode(node);
@@ -3443,25 +3546,28 @@ function assetCard(f, node, meta = {}) {
   }
   /* 启用 / 停用：
      · 停用 = 这次生成不用这个素材（节点还留在画布上，随时能开回来）
-     · 工作流里本来就是 bypass 的，给一个明确的「启用」口 */
-  if (!inc) {
-    if (forced || (meta.off && hasFile)) {
-      const on = document.createElement("button");
-      on.className = "mini-btn on";
-      on.textContent = "启用";
-      on.title = forced
-        ? "重新把这一格接回生成流程"
+     · 工作流里本来就是 bypass 的，给一个明确的「启用」口
+     ⚠️ 「启用」不能跟着 !inc 一起跳过：接了上游线的格子，只要它自己的加载节点还在旁路
+        （线在、节点却没进提交），就会标「未生效」—— 以前这种格子一个按钮都没有，
+        只能回 ComfyUI 按 Ctrl+B 解旁路。 */
+  if ((forced || (meta.off && (hasFile || inc))) && nid) {
+    const on = document.createElement("button");
+    on.className = "mini-btn on";
+    on.textContent = "启用";
+    on.title = forced
+      ? "重新把这一格接回生成流程"
+      : inc
+        ? "这一格的加载节点在 ComfyUI 里是旁路（线还连着，但这次生成不带它）· 点这里救回来，并写回文件"
         : "把这个素材节点从 bypass 状态救回来，并接到参考槽上（同时写回 ComfyUI）";
-      on.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, false); };
-      btns.push(on);
-    } else if (hasFile && nid) {
-      const stop = document.createElement("button");
-      stop.className = "mini-btn stop";
-      stop.textContent = tile ? "停用" : "不启用";
-      stop.title = "这次生成先不用这个素材，并同步把 ComfyUI 里的这个节点旁路（节点不删，随时能开回来）";
-      stop.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, true); };
-      btns.push(stop);
-    }
+    on.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, false); };
+    btns.push(on);
+  } else if (!inc && hasFile && nid) {
+    const stop = document.createElement("button");
+    stop.className = "mini-btn stop";
+    stop.textContent = tile ? "停用" : "不启用";
+    stop.title = "这次生成先不用这个素材，并同步把 ComfyUI 里的这个节点旁路（节点不删，随时能开回来）";
+    stop.onclick = (e) => { e.stopPropagation(); setAssetOff(node, nid, true); };
+    btns.push(stop);
   }
   /* 点「＋」露出来的空槽：不想用了能收回去 */
   if (meta.clearable && slotBlank(cur)) {
@@ -3613,6 +3719,17 @@ function paintStatus(node) {
   const st = el.querySelector(".node-status");
   if (!st) return;
 
+  /* 运行中：那枚 ▶ 变成红色 ■（同一个位置，点一下就停） */
+  const rb = el.querySelector(".nbtn.run");
+  if (rb) {
+    const running = node.status === "running";
+    rb.classList.toggle("stop", running);
+    rb.textContent = running ? "■" : "▶";
+    rb.title = running
+      ? "停止：中断 ComfyUI 正在跑的这一次（还在排队没开始的也一并撤掉）"
+      : "运行 (Ctrl+Enter)";
+  }
+
   /* 节点头上的 ⟳：亮黄点 = ComfyUI 那边的文件比画布新 */
   const sb = el.querySelector(".nbtn.sync");
   if (sb) {
@@ -3663,6 +3780,8 @@ function paintStatus(node) {
     const where = node.sType === "temp" ? "临时（会被 ComfyUI 清理，建议另存）"
       : node.sType === "input" ? "来自 input" : "来自 output";
     st.textContent = `${WANT_CN[node.inKind] || ""} · ${where}`;
+  } else if (node.status === "stopped") {
+    st.textContent = "已停止" + (node.elapsed ? ` · ${node.elapsed}s` : "");
   } else if (node.status === "done") {
     st.classList.add("ok");
     st.textContent = "完成" + (node.elapsed ? ` · ${node.elapsed}s` : "")
@@ -3854,6 +3973,11 @@ async function runNode(node, _seen = new Set()) {
   if (node.status === "running" || _seen.has(node.id)) return;
   _seen.add(node.id);
   node.status = "running"; node.error = ""; node.progress = "提交中…"; node.wired = null;
+  /* 中止开关一开始就建好：传素材那一大段也在「运行中」，
+     这时候点停止不该等它传完才生效 */
+  node._abort = new AbortController();
+  node._stopping = false;
+  node.promptId = null;
   renderNode(node);
   const t0 = Date.now();
   try {
@@ -3968,10 +4092,17 @@ async function runNode(node, _seen = new Set()) {
 
     /* 内联来源只给面板看，不进提交体 */
     for (const nd of Object.values(prompt)) if (nd?._meta?.inlined) delete nd._meta.inlined;
+    /* 传素材、算上游那段时间里点过「停止」：到这儿就别提交了 */
+    if (node._stopping) throw new Error("已取消");
     const id = await api.submit(expandPromptTokens(prompt));
+    /* 记下任务号：跑起来之后按钮变「停止」，点的就是这一次 */
+    node.promptId = id;
     node.progress = "运行中…";
     renderNode(node);
-    const res = await api.waitFor(id, { onTick: (t) => { node.progress = t; renderNode(node); } });
+    const res = await api.waitFor(id, {
+      onTick: (t) => { node.progress = t; renderNode(node); },
+      signal: node._abort.signal,
+    });
     node.result = res;
     node.status = "done";
     node.progress = "";
@@ -3983,13 +4114,58 @@ async function runNode(node, _seen = new Set()) {
       toast(`有连着的节点没收下产出：${out.mismatch.join("；")}`, "err", 6500);
     }
   } catch (e) {
-    node.status = "error";
-    node.error = e.message;
-    toast(e.message, "err", 6000);
+    if (node._stopping || /已取消/.test(e.message)) {
+      /* 自己点的「停止」不算失败：状态清成「已停止」，别留一片红 */
+      node.status = "stopped";
+      node.progress = "";
+      node.error = "";
+      node.elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      toast("已停止这次运行", "", 2600);
+    } else {
+      node.status = "error";
+      node.error = e.message;
+      toast(e.message, "err", 6000);
+    }
   }
+  node._stopping = false;
+  node.promptId = null;
+  node._abort = null;
   renderNode(node);
   if (node.status === "done") ensureNodeVisible(node);
   save();
+}
+
+/**
+ * 停止这一次运行：先撤掉「还在排队」的那一份，再中断正在跑的那一份。
+ * ComfyUI 的 /api/interrupt 只打当前正在执行的任务 —— 提交完立刻点停止时
+ * 多半还没轮到它，光 interrupt 打不着，所以队列也得撤。
+ */
+async function stopRun(node) {
+  if (node.status !== "running" || node._stopping) return;
+  node._stopping = true;
+  node.progress = "停止中…";
+  renderNode(node);
+  const pid = node.promptId || "";
+  /* 轮询先停：按钮立刻回来，不等网络（被中断的 prompt 永远不会进 history） */
+  node._abort?.abort();
+  let bad = "";
+  try {
+    if (pid) await api.deleteQueued(pid);
+    await api.interrupt(pid);
+  } catch (e) { bad = e.message; }
+  if (bad) {
+    toast(`画布这边已停，但 ComfyUI 没接住中断请求（${bad}）—— 去 ComfyUI 里手动取消一下队列`, "err", 6500);
+  }
+  /* 兜底：万一轮询那边没接住（还在传素材、或本来就没提交），
+     别让按钮永远卡在「停止中」 */
+  if (node._stopping) {
+    node._stopping = false;
+    if (node.status === "running") {
+      node.status = "stopped";
+      node.progress = "";
+      renderNode(node);
+    }
+  }
 }
 
 /* ==================================================================

@@ -449,6 +449,15 @@ html, body {
 .nbtn.run { background: #2c4a34; color: #7fe0ab; width: 30px; }
 .nbtn.run:hover { background: #365c41; }
 .nbtn.run:disabled { opacity: .5; }
+/* 跑起来之后这枚按钮变成「停止」：同一个位置、红色方块，点一下中断这一次 */
+.nbtn.run.stop {
+  background: #4a2a2a; color: #ff8b8b;
+  box-shadow: 0 0 0 2px rgba(255, 90, 90, .18);
+  animation: stopPulse 1.8s ease-in-out infinite;
+}
+.nbtn.run.stop:hover { background: #5d3434; color: #ffb8b8; }
+body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
+@keyframes stopPulse { 50% { box-shadow: 0 0 0 4px rgba(255, 90, 90, .06); } }
 
 /* 与 ComfyUI 同步：ComfyUI 那边的文件更新了就在这里亮黄点 */
 .nbtn.sync { width: 24px; color: #8fa4c2; }
