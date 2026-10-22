@@ -4,7 +4,7 @@
 模型都摊在节点里改，跑完的结果自动接到旁边，可以继续往下喂。
 
 ```
-v1.0.0 · MIT · Windows / macOS / Linux
+v1.0.0 · 源码公开 · 仅限非商业使用 · Windows / macOS / Linux
 ```
 
 为什么不用 ComfyUI 自带的面板：
@@ -554,7 +554,7 @@ xy-wxhb/
 ├── start.sh          macOS / Linux 启动器
 ├── VERSION           版本号（唯一来源，打包脚本和 serve.py 都读它）
 ├── build-release.py  打绿色包：dist/xy-wxhb-vX.Y.Z.zip + .sha256
-├── LICENSE           MIT
+├── LICENSE           PolyForm Noncommercial 1.0.0（源码公开，禁止商用）
 ├── comfy-root.txt    ComfyUI 根目录（手动指定后生成，不进仓库）
 └── docs/             早期界面截图（当前 README 未引用，默认不打进发布包）
 ```
@@ -587,7 +587,21 @@ python build-release.py        # dist/xy-wxhb-vX.Y.Z.zip + .sha256
 
 ## 许可
 
-[MIT](LICENSE) © 2026 xy-wxhb contributors
+[PolyForm Noncommercial 1.0.0](LICENSE) © 2026 xy-wxhb contributors
+
+**源码公开，但只许非商业使用。** 严格说这是 source-available（源码可得），不是开源 ——
+开源协议的硬条件之一就是不得限制使用领域，因此任何 OSI 认证协议都无法禁止商用。
+这里用的是专为此场景编写的 PolyForm 非商业条款。
+
+| 你可以 | 你不可以 |
+|---|---|
+| 下载、阅读、修改源码 | 拿去做任何商业用途（含公司内部业务、给客户交付、SaaS 收费） |
+| 自己用、学习、研究、玩票、做毕设 | 把改过的版本卖掉或提供付费服务 |
+| 转给朋友（须随附本许可证与版权声明） | 抹掉版权与许可声明后重新发布 |
+
+个人自用、学习研究**免费且无需申请**。需要商业授权（含公司内部使用）请先联系作者。
+
+作者本人是版权人，不受上述限制 —— 自己的代码自己什么时候都能商用，也可以另行签发商业许可。
 
 本项目没有引入任何前端框架、图标库或 Python 第三方包。
 ComfyUI 本身按 GPL-3.0 分发，这里只是通过它的 HTTP 接口调用，不包含其代码。

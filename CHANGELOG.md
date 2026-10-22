@@ -44,3 +44,9 @@
 - 提供 Windows `start.bat` 与 macOS / Linux `start.sh`，自动寻找 Python 3.8+
 - 端口被占用自动往后顺延，重复双击不会起第二个实例
 - `build-release.py` 产出带 SHA256 的绿色包
+
+**许可**
+
+- 采用 **PolyForm Noncommercial 1.0.0**：源码公开，允许阅读、修改、个人非商业自用，禁止商业使用
+- 不用 MIT / Apache 等开源协议 —— 开源协议按规定不得限制使用领域，挡不住商用
+- 作者本人是版权人，不受限制，可自行商用或另行签发商业许可

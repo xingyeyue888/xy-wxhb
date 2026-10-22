@@ -136,7 +136,10 @@ def main():
             "没装 Python 也能用——若已装 ComfyUI，启动脚本会自动借用它自带的 Python。\r\n"
             "端口被占用时会自动往后找（8278、8279…），控制台会打印实际地址。\r\n"
             "\r\n"
-            "详细说明见 README.md，许可证见 LICENSE（MIT）。\r\n"
+            "详细说明见 README.md。\r\n"
+            "\r\n"
+            "许可证：PolyForm Noncommercial 1.0.0（见 LICENSE）\r\n"
+            "个人使用、学习、研究免费；禁止任何商业用途（含公司内部业务）。\r\n"
             % ver
         ).encode("utf-8"))
 

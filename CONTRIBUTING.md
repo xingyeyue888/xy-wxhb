@@ -71,4 +71,5 @@ python build-release.py --no-docs  # 不带截图，体积小一半
 
 ## 许可
 
-提交的代码按 [MIT](LICENSE) 授权。
+提交的代码按 [PolyForm Noncommercial 1.0.0](LICENSE) 授权 —— 源码公开，但只许非商业使用。
+提交 PR 即表示你同意自己的改动也按这份条款分发。
