@@ -2,7 +2,7 @@
 build-release.py —— 打一个「解压即用」的绿色包
 
 用法：
-    python build-release.py                # dist/xy-wxhb-v1.0.0.zip
+    python build-release.py                # dist/xy-wxhb-vX.Y.Z.zip
     python build-release.py --with-docs    # 连 docs/ 截图一起收（当前 README 未引用，默认不收）
     python build-release.py --out D:/tmp   # 换输出目录
 

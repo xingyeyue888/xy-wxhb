@@ -2,7 +2,7 @@
  * app.js —— 本地无限画布主程序
  */
 import * as api from "./api.js";
-import { convertWorkflow, listWidgets, expandPromptTokens } from "./convert.js";
+import { convertWorkflow, listWidgets, normalizeCombo, expandPromptTokens } from "./convert.js";
 import { CanvasView } from "./canvas.js";
 
 const $ = (s) => document.querySelector(s);
@@ -805,12 +805,21 @@ async function pushModesToComfy(node, { quiet = false } = {}) {
   }
 }
 
-/* ---------------- 参数写回：LoRA 强度 / 换模型 ----------------
-   以前只有「启停」会写回文件，强度只在画布内存和提交体里生效：
-   在画布上把 strength 拉到 0，回 ComfyUI 打开那份工作流还是 1.0 ——
-   同一份工作流两个强度，跑出来的东西当然对不上。现在 LoRA 段的改动也往回写。
+/* ---------------- 参数写回：画布上改的每一格都同步进工作流文件 ----------------
+   以前只有「启停」和 LoRA 段会写回，其余一律只活在画布内存和提交体里：
+   在画布上把步数从 20 改成 8、把提示词重写一遍、换一张参考图，回 ComfyUI 打开
+   同一份工作流还是旧值 —— 同一份工作流两个版本，跑出来当然对不上。
+   现在画布上能改的（参数、采样器、模型、LoRA、素材文件、提示词）全都往回写。
+
+   三条规矩：
+   · 按节点攒 700ms 一起写 —— 拖 spinner、连着敲提示词时不会每一下都落盘
+   · 以磁盘那份为底再改字段 —— ComfyUI 那页可能刚存过，拿内存里的旧版整个盖回去
+     会把人家的改动吃掉
+   · 写完回读校验，被盖掉就补写一次；还不对就把话说明白，不假装成功
 ================================================================== */
-const paramPushTimers = new Map();
+const PUSH_DEBOUNCE = 700;
+const pushQueue = new Map();       // 画布节点 id → Map("nodeId|field" → {nid, field, value})
+const pushTimers = new Map();
 
 /** 某个 widget 在 widgets_values 数组里的位置（跟 listWidgets 的排法一致） */
 function widgetIndexOfField(cls, field) {
@@ -824,6 +833,37 @@ function widgetIndexOfField(cls, field) {
   return -1;
 }
 
+/** 读工作流节点里某个参数现在存的值（named 优先，其次按 widget 顺序找数组位） */
+function readUiWidget(nd, cls, field) {
+  if (!nd) return undefined;
+  const named = (nd.widgets_values_named && typeof nd.widgets_values_named === "object") ? nd.widgets_values_named
+    : (!Array.isArray(nd.widgets_values) && nd.widgets_values && typeof nd.widgets_values === "object") ? nd.widgets_values
+      : null;
+  if (named && field in named) return named[field];
+  const arr = Array.isArray(nd.widgets_values) ? nd.widgets_values : null;
+  if (!arr) return undefined;
+  const i = widgetIndexOfField(cls, field);
+  return i >= 0 && i < arr.length ? arr[i] : undefined;
+}
+
+/** 数组位是按 object_info 的 widget 顺序推出来的，写之前核一下类型：
+    本来是数字的口别塞字符串进去 —— 宁可不写，也别把隔壁参数串了 */
+function typeFits(old, v) {
+  if (old === undefined) return true;
+  if (typeof old === "number") return typeof v === "number" && Number.isFinite(v);
+  if (typeof old === "boolean") return typeof v === "boolean";
+  if (typeof old === "string") return typeof v === "string";
+  return false;
+}
+
+/** 下拉值在文件里可能存成「值 — 中文说明」（task_type 就是这样），
+    比较前先归一化 —— 否则每次改别的参数都会把它无谓地重写一遍 */
+function normWidget(cls, field, v) {
+  if (typeof v !== "string") return v;
+  const w = listWidgets(S.oi?.[cls] || {}).find(x => x.name === field);
+  return w ? normalizeCombo(v, w.choices) : v;
+}
+
 /** 把 UI 工作流里某个节点的某个参数改成新值（named / 数组两种存法都改） */
 function setUiWidget(nd, cls, field, value) {
   let hit = false;
@@ -833,70 +873,140 @@ function setUiWidget(nd, cls, field, value) {
   if (named && field in named) { named[field] = value; hit = true; }
   const arr = Array.isArray(nd.widgets_values) ? nd.widgets_values : null;
   const i = widgetIndexOfField(cls, field);
-  if (arr && i >= 0 && i < arr.length) { arr[i] = value; hit = true; }
+  if (arr && i >= 0 && i < arr.length && typeFits(arr[i], value)) { arr[i] = value; hit = true; }
   return hit;
 }
 
-/** 攒一下再写：拖 spinner 时每一下都落盘会把文件写烂，也容易撞上 ComfyUI 的自动保存 */
-function scheduleLoraPush(node, f, value) {
-  if (!syncCfg.push || node.kind !== "workflow" || !node.file) return;
-  if (!f.nodeId || !f.name) return;
-  const key = node.id + "|" + f.nodeId + "|" + f.name;
-  clearTimeout(paramPushTimers.get(key));
-  paramPushTimers.set(key, setTimeout(() => {
-    paramPushTimers.delete(key);
-    pushParamToComfy(node, f.nodeId, f.name).catch(() => { });
-  }, 650));
+/** 同一个节点连着改好几格，提示别刷屏 */
+const pushToastAt = new Map();
+function pushToast(node, text, kind) {
+  const now = Date.now();
+  if (now - (pushToastAt.get(node.id) || 0) < 2500) return;
+  pushToastAt.set(node.id, now);
+  toast(text, kind, 2600);
 }
 
-/** 把一个参数写回工作流文件，写完回读校验（跟启停同一套规矩：200 不算成功） */
-async function pushParamToComfy(node, nid, field) {
+/** 记一笔「画布上改了，待写回」。攒到 700ms 没新动静才真正落盘 */
+function queueParamPush(node, nid, field, value) {
+  if (!syncCfg.push || node?.kind !== "workflow" || !node.file) return;
+  if (nid === undefined || nid === null || !field || value === undefined) return;
+  const k = String(nid) + "|" + field;
+  let q = pushQueue.get(node.id);
+  if (!q) { q = new Map(); pushQueue.set(node.id, q); }
+  q.set(k, { nid: String(nid), field, value });
+  clearTimeout(pushTimers.get(node.id));
+  pushTimers.set(node.id, setTimeout(() => {
+    pushTimers.delete(node.id);
+    flushParamPush(node).catch(() => { });
+  }, PUSH_DEBOUNCE));
+}
+
+/**
+ * 把攒下的改动写进工作流文件。
+ * 底稿是磁盘上那份，不是内存里的 —— 反过来的话，ComfyUI 那页刚存的改动会被整份盖掉。
+ */
+async function flushParamPush(node) {
+  if (node?._pushing) { node._pushAgain = true; return { skipped: 1 }; }   // 正写着：等它写完再来一轮
+  const q = pushQueue.get(node.id);
+  if (!q || !q.size) return { skipped: 1 };
+  const items = [...q.values()];
+  q.clear();
   if (!node?.uiWf || node.kind !== "workflow" || !node.file) return { skipped: 1 };
-  const want = node.params[String(nid) + "|" + field];
-  if (want === undefined) return { skipped: 1 };
-  const ui = (node.uiWf.nodes || []).find(n => String(n.id) === String(nid));
-  if (!ui) {
-    toast(`「${field}」改的是画布补出来的那份，ComfyUI 的文件里没有这个节点`, "", 4200);
-    return { skipped: 1 };
+  node._pushing = true;
+  try {
+    return await flushParamPushInner(node, items);
+  } finally {
+    node._pushing = false;
+    if (node._pushAgain) {
+      node._pushAgain = false;
+      if (pushQueue.get(node.id)?.size) flushParamPush(node).catch(() => { });
+    }
   }
-  const snapshot = JSON.parse(JSON.stringify(node.uiWf));
-  if (!setUiWidget(ui, ui.type, field, want)) {
-    toast(`ComfyUI 的工作流里没存着「${field}」这一格，写不进去`, "err", 5000);
-    return { skipped: 1 };
+}
+
+async function flushParamPushInner(node, items) {
+  /* 写到磁盘之后，画布内存也跟上，别让两边各执一份 */
+  const applyMemory = () => {
+    for (const it of items) {
+      const ui = (node.uiWf.nodes || []).find(n => String(n.id) === it.nid);
+      if (ui) setUiWidget(ui, ui.type, it.field, it.value);
+    }
+  };
+
+  const disk = await api.getWorkflow(node.file).catch(() => null);
+  if (!disk) return { skipped: 1 };
+  const snapshot = JSON.parse(JSON.stringify(disk));
+
+  const applied = [];
+  for (const it of items) {
+    const nd = (disk.nodes || []).find(n => String(n.id) === it.nid);
+    if (!nd) continue;                                                      // 画布补出来的节点，文件里没有
+    const cur = readUiWidget(nd, nd.type, it.field);
+    if (sameVal(cur, it.value) || sameVal(normWidget(nd.type, it.field, cur), it.value)) continue;  // 文件里已经是这个值
+    if (!setUiWidget(nd, nd.type, it.field, it.value)) continue;             // 这一格没存在文件里
+    /* 导演台的分段模式：时间线 JSON 里的 taskType 优先级更高，只改 widget 等于没改 */
+    if (RE_MODE.test(it.field) && DIRECTOR_CLS.test(String(nd.type || ""))) {
+      const tl = readUiWidget(nd, nd.type, "timeline_data");
+      const next = patchTimeline(tl, (o) => { (o.global = o.global || {}).taskType = it.value; });
+      if (next && next !== tl) setUiWidget(nd, nd.type, "timeline_data", next);
+    }
+    applied.push(it);
   }
+  if (!applied.length) { applyMemory(); return { skipped: 1 }; }
+
   const readBack = async () => {
     const wf = await api.getWorkflow(node.file).catch(() => null);
-    const nd = (wf?.nodes || []).find(n => String(n.id) === String(nid));
-    if (!nd) return { ok: false, why: "节点不在了" };
-    const named = (nd.widgets_values_named && typeof nd.widgets_values_named === "object") ? nd.widgets_values_named : null;
-    const arr = Array.isArray(nd.widgets_values) ? nd.widgets_values : null;
-    const i = widgetIndexOfField(nd.type, field);
-    const got = named && field in named ? named[field] : (arr && i >= 0 ? arr[i] : undefined);
-    return { ok: sameVal(got, want), got };
+    if (!wf) return { ok: false, miss: applied.map(a => a.field) };
+    const miss = applied.filter(it => {
+      const nd = (wf.nodes || []).find(n => String(n.id) === it.nid);
+      if (!nd) return true;
+      const got = readUiWidget(nd, nd.type, it.field);
+      return !(sameVal(got, it.value) || sameVal(normWidget(nd.type, it.field, got), it.value));
+    }).map(it => it.field);
+    return { ok: !miss.length, miss };
   };
+
   try {
     await backupWorkflowOnce(node, snapshot);
-    await api.saveWorkflow(node.file, node.uiWf);
+    await api.saveWorkflow(node.file, disk);
     let r = await readBack();
     if (!r.ok) {
       /* 被 ComfyUI 那一页盖掉了 → 补写一次再算数 */
-      await api.saveWorkflow(node.file, node.uiWf);
+      await api.saveWorkflow(node.file, disk);
       r = await readBack();
     }
+    applyMemory();
     node.wfSig = wfDigest(node.uiWf);
     const meta = await api.getWorkflowMeta(node.file).catch(() => null);
     if (meta?.mtime) node.fileMtime = meta.mtime;
     node.stale = false;
     if (!r.ok) {
-      toast(`「${field}」没写回 ComfyUI：文件里还是 ${r.got ?? "（空）"}`
-        + " —— ComfyUI 那边是不是正开着这份工作流？关掉那一页再改一次", "err", 7000);
-      return { error: true };
+      pushToast(node, `没写回 ComfyUI：${r.miss.slice(0, 3).join("、")}`
+        + " —— ComfyUI 那边是不是正开着这份工作流？关掉那一页再改一次", "err");
+      return { error: 1, miss: r.miss };
     }
-    toast(`已写回 ComfyUI：「${field}」= ${want}`, "ok", 2200);
-    return { ok: true };
+    const names = applied.map(a => a.field);
+    pushToast(node, names.length === 1
+      ? `已写回 ComfyUI：「${names[0]}」`
+      : `已写回 ComfyUI：${names.slice(0, 3).join("、")}${names.length > 3 ? ` 等 ${names.length} 项` : ""}`, "ok");
+    return { ok: 1, count: names.length };
   } catch (e) {
-    toast(`写回 ComfyUI 失败：${e.message}`, "err", 6000);
-    return { error: true };
+    pushToast(node, `写回 ComfyUI 失败：${e.message}`, "err");
+    return { error: 1 };
+  }
+}
+
+/** 文本节点的内容 → 它连着的那些工作流输入口（提示词就是这么同步进 ComfyUI 的） */
+function queueTextPush(node) {
+  if (!syncCfg.push || node?.kind !== "input" || node.inKind !== "text") return;
+  const text = node.value ?? "";
+  for (const e of S.edges || []) {
+    if (e.from !== node.id || !e.key) continue;
+    const t = S.nodes.find(n => n.id === e.to);
+    if (!t || t.kind !== "workflow") continue;
+    const bar = String(e.key).lastIndexOf("|");
+    if (bar < 0) continue;
+    queueParamPush(t, e.key.slice(0, bar), e.key.slice(bar + 1), text);
   }
 }
 
@@ -1708,9 +1818,9 @@ function fieldControl(f, node, opt) {
       wrap.appendChild(t);
     } else if (!m && tip) tip.remove();
     scheduleSave();
-    /* LoRA 段的强度 / 换模型：画布上改完要落进 ComfyUI 的工作流文件 ——
-       不然从 ComfyUI 界面跑同一份工作流，用的还是文件里那个旧强度 */
-    if (cls === "lora") scheduleLoraPush(node, f, v);
+    /* 改了哪一格就同步哪一格：参数、采样器、模型、LoRA 强度、提示词，一个不落。
+       不写回的话，从 ComfyUI 界面跑同一份工作流用的还是文件里那个旧值 */
+    queueParamPush(node, f.nodeId, f.name, v);
   };
 
   if (Array.isArray(f.choices) && f.choices.length) {
@@ -2107,6 +2217,9 @@ function slotField(node, s) {
 /** 素材被改（上传 / 换文件）：写值 → 接线 → 重画 */
 function commitAsset(node, f, v) {
   node.params[f.key] = v;
+  /* 换图 / 换模型 / 传文件：文件名本身也是工作流里的一格，一起写回去，
+     不然画布上换了图，回 ComfyUI 打开还是老图 */
+  queueParamPush(node, f.nodeId, f.name, v);
   /* 用户在这里动手 = 明确要用这个素材节点，bypass 的也要救回来 */
   if (f.nodeId) {
     node.assetOn = [...new Set([...(node.assetOn || []), String(f.nodeId)])];
@@ -2590,6 +2703,7 @@ function renderInputBody(node, el) {
         node.value = pull.value;
         node.pulled = null;
         renderNode(node); save();
+        queueTextPush(node);
         toast("已填进输入框", "ok");
       };
       const drop = document.createElement("button");
@@ -2609,6 +2723,7 @@ function renderInputBody(node, el) {
       node.value = ta.value;
       scheduleSave();
       paintStatus(node);
+      queueTextPush(node);        // 接在工作流提示词口上的，顺带写回 ComfyUI
     };
     body.appendChild(ta);
     return;
@@ -5577,6 +5692,11 @@ window.__xy = {
   loraSyncChip,
   loraNameOf,
   checkWorkflowStale,
+  queueParamPush,
+  flushParamPush,
+  queueTextPush,
+  readUiWidget,
+  setUiWidget,
   wfDigest,
   createPulledInput,
   openWfPicker,
