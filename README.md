@@ -1,22 +1,77 @@
 # 本地无限画布 · wy-canvas
 
-一个**零依赖的纯前端无限画布**，直接对接你本机的 ComfyUI（`127.0.0.1:8188`），
-用来把你的 ComfyUI 工作流摆到画布上跑图 / 跑视频。
+把 ComfyUI 的工作流摆到一块无限画布上：**一个节点 = 一次生成**。素材、参数、LoRA、
+模型都摊在节点里改，跑完的结果自动接到旁边，可以继续往下喂。
 
-不用装 Python 包、不用改 ComfyUI、不用注册登录。整个应用就是几个静态文件。
+```
+v1.0.0 · MIT · Windows / macOS / Linux
+```
+
+为什么不用 ComfyUI 自带的面板：
+
+- **零安装** —— 纯前端 + 一个只用 Python 标准库的脚本，不需要 npm，不需要 `pip install`
+- **不改 ComfyUI** —— 只通过它自己的 HTTP 接口读写工作流和素材，装在哪个盘都能用
+- **本地优先** —— 默认只听 `127.0.0.1`，不联网、不注册、不上传任何东西
+- **面向长流程** —— 一条片子几十个镜头时，队列和节点图比一排标签页看得清
 
 ---
 
-## 启动
+## 快速开始
 
-双击 **`start.bat`**。
+**前提**：本机 ComfyUI 已经跑起来（默认 `http://127.0.0.1:8188`）。
+画布只负责连它，不负责启动它。
 
-它会用 ComfyUI 整合包自带的 Python 起一个静态服务器（端口 `8277`）并打开浏览器。
+### 方式一：下载绿色包（推荐，不用装任何东西）
 
-> 为什么需要个本地服务器？因为 ES module 在 `file://` 下会被浏览器拦。
-> 想换端口/换 Python，改 `start.bat` 里的 `PORT` / `PY` 两个变量。
+1. 到 [Releases](../../releases) 下载 `wy-canvas-v1.0.0.zip`，解压到任意目录
+2. Windows 双击 **`start.bat`**；macOS / Linux 执行 **`./start.sh`**
+3. 浏览器自动打开 `http://127.0.0.1:8277/`
 
-**前提**：ComfyUI 已经在跑（端口 8188）。本应用只连它，不负责启动它。
+启动脚本会自己找 Python，按这个顺序：`WY_PYTHON` 环境变量 → 同目录的便携 Python →
+**ComfyUI 整合包自带的 Python** → `py -3` → PATH 里的 `python` / `python3` → 扫一遍磁盘上的 `ComfyUI*/`。
+所以只要你机器上跑着 ComfyUI，通常什么都不用配。
+
+### 方式二：从源码跑
+
+```bash
+git clone <本仓库地址>
+cd wy-canvas
+python serve.py          # 需要 Python 3.8+
+```
+
+### 系统要求
+
+| 项 | 要求 |
+|---|---|
+| 系统 | Windows 10 / 11，macOS，Linux |
+| Python | 3.8 以上（只用来起本地服务，不需要装第三方包） |
+| 浏览器 | Chrome / Edge / Firefox 近两年的版本（用了 ES module、CSS 变量） |
+| ComfyUI | 任意版本，能正常出图即可；素材库需要它的 `input` / `output` 目录可读 |
+
+### 启动参数
+
+```bash
+python serve.py -p 9000        # 换端口（被占用时会自动往后找）
+python serve.py --no-browser   # 不自动开浏览器
+python serve.py --host 0.0.0.0 # 让局域网其它设备也能访问（默认只听本机）
+python serve.py -v             # 看版本
+```
+
+> 为什么非要起个本地服务器？因为 ES module 在 `file://` 下会被浏览器拦掉。
+> 这个服务只做两件事：发静态文件，以及代理「素材库」需要的列目录 / 删文件
+> （ComfyUI 官方接口只给按文件名取文件，没有列目录）。
+
+### 出问题了
+
+| 现象 | 原因与处理 |
+|---|---|
+| 双击后窗口一闪就没 | 没找到 Python。命令行里跑 `start.bat` 能看到具体提示；或先 `set WY_PYTHON=你的python.exe路径` 再启动 |
+| 提示端口被占 | 会自动改用 8278、8279…，看控制台打印的地址即可；也可以 `-p` 指定 |
+| 页面能开，但一直「未连接」 | ComfyUI 没开，或地址不对。在顶栏输入框改完点「连接」 |
+| 素材库显示「未就绪」 | 没自动认出 ComfyUI 根目录。在素材库面板里手动选一次，之后会记住（存进 `comfy-root.txt`） |
+| 改完代码没生效 | `serve.py` 要重启；前端刷新即可（静态资源是 `no-store`，不吃缓存） |
+
+更细的用法、每块面板为什么这么设计，见下面正文。
 
 ---
 
@@ -495,12 +550,18 @@ wy-canvas/
 │   ├── convert.js    UI 工作流 → API prompt（核心）
 │   └── api.js        ComfyUI 客户端
 ├── serve.py          静态服务器 + 素材库 API（列目录/建子库/改名/删文件）
-├── comfy-root.txt    ComfyUI 根目录（手动指定后生成）
-└── start.bat         启动器（纯 ASCII，别往里写中文）
+├── start.bat         Windows 启动器（纯 ASCII，别往里写中文）
+├── start.sh          macOS / Linux 启动器
+├── VERSION           版本号（唯一来源，打包脚本和 serve.py 都读它）
+├── build-release.py  打绿色包：dist/wy-canvas-vX.Y.Z.zip + .sha256
+├── LICENSE           MIT
+├── comfy-root.txt    ComfyUI 根目录（手动指定后生成，不进仓库）
+└── docs/             早期界面截图（当前 README 未引用，默认不打进发布包）
 ```
 
 > `start.bat` 里**不能出现中文**：cmd 按 GBK 解析 .bat，UTF-8 中文会被切成乱码
 > 导致命令报错。这是上一版「启动器打开网页报错」的根因，别踩回去。
+> 同理，bat 要存成 **CRLF** 换行 —— LF 下 `goto` 可能找不到标签。
 
 ### 调试
 
@@ -511,6 +572,25 @@ __wy.S            // 全部状态：nodes / edges / workflows / oi
 __wy.view         // 画布实例：setPos / fitToContent / setView
 __wy.runNode(__wy.S.nodes[0])   // 手动跑某个节点
 ```
+
+---
+
+## 参与开发
+
+改法、代码约定、提交前自测清单见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+打发布包（版本号只改 `VERSION` 一处）：
+
+```bash
+python build-release.py        # dist/wy-canvas-vX.Y.Z.zip + .sha256
+```
+
+## 许可
+
+[MIT](LICENSE) © 2026 wy-canvas contributors
+
+本项目没有引入任何前端框架、图标库或 Python 第三方包。
+ComfyUI 本身按 GPL-3.0 分发，这里只是通过它的 HTTP 接口调用，不包含其代码。
 
 ---
 

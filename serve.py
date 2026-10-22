@@ -21,6 +21,7 @@ serve.py —— 本地无限画布的静态服务器 + 素材库 API
   所有路径都做越界校验，只允许动 input / output 里面。
 """
 
+import argparse
 import http.server
 import json
 import os
@@ -31,12 +32,25 @@ import socketserver
 import sys
 import threading
 import urllib.parse
+import urllib.request
 import webbrowser
 
-PORT = int(os.environ.get("WY_CANVAS_PORT", "8277"))
-HOST = "127.0.0.1"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ROOT_CFG = os.path.join(ROOT, "comfy-root.txt")
+
+
+def _read_version():
+    """版本号只认 VERSION 这一个文件，打包脚本也读它，避免两处对不上"""
+    try:
+        with open(os.path.join(ROOT, "VERSION"), "r", encoding="utf-8") as f:
+            return f.read().strip() or "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+VERSION = _read_version()
+PORT = int(os.environ.get("WY_CANVAS_PORT", "8277"))
+HOST = os.environ.get("WY_CANVAS_HOST", "127.0.0.1")
 
 KINDS = ("input", "output")
 
@@ -539,44 +553,94 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def port_busy(port):
+def port_busy(port, host=None):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.4)
-        return s.connect_ex((HOST, port)) == 0
+        return s.connect_ex((host or HOST, port)) == 0
 
 
-def main():
-    url = "http://%s:%d/" % (HOST, PORT)
-
-    if port_busy(PORT):
-        print()
-        print("  端口 %d 已有服务在跑，直接打开：%s" % (PORT, url))
-        print("  （如果那是别的程序占的，改 serve.py 里的 PORT 即可）")
-        webbrowser.open(url)
-        return 0
-
+def is_ours(port, host=None):
+    """端口上跑的是不是本画布（重复双击时别又起一个，直接开已有的）"""
+    url = "http://%s:%d/api/lib/root" % (host or HOST, port)
     try:
-        httpd = Server((HOST, PORT), Handler)
-    except OSError as e:
-        print()
-        print("  启动失败：%s" % e)
-        print("  端口 %d 被占用或权限不足，改 serve.py 里的 PORT 再试。" % PORT)
-        return 1
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(url, timeout=1.2) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return isinstance(data, dict) and "root" in data and "candidates" in data
+    except Exception:
+        return False
 
-    r = comfy_root()
+
+def bind_server(host, want, span=20):
+    """从 want 开始往后找一个能绑上的端口。返回 (server, port)，找不到给 (None, None)"""
+    err = None
+    for p in range(want, want + span):
+        try:
+            return Server((host, p), Handler), p
+        except OSError as e:
+            err = e
+    sys.stderr.write("  %d-%d 都绑不上：%s\n" % (want, want + span - 1, err))
+    return None, None
+
+
+def banner(url, comfy):
+    line = "  " + "-" * 54
     print()
-    print("  ============================================")
-    print("   本地无限画布")
-    print("   地址： %s" % url)
-    print("   ComfyUI： %s" % r)
-    if not r:
-        print("   ! 没找到 ComfyUI 的 input/output，素材库会显示未就绪")
-    print("   关闭本窗口即停止服务")
-    print("  ============================================")
+    print(line)
+    print("   本地无限画布   v%s" % VERSION)
+    print(line)
+    print("   地址      %s" % url)
+    print("   ComfyUI   %s" % (comfy or "未找到"))
+    print("   Python    %s" % sys.version.split()[0])
+    if not comfy:
+        print()
+        print("   ! 没找到 ComfyUI 的 input / output 目录，素材库会显示未就绪。")
+        print("     在页面「素材库」里指定一次 ComfyUI 目录即可，之后会记住。")
+    print()
+    print("   关闭本窗口（或按 Ctrl+C）即停止服务")
+    print(line)
     print()
     sys.stdout.flush()
 
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="serve.py",
+        description="本地无限画布：静态服务器 + 素材库 API（对接本机 ComfyUI）",
+    )
+    ap.add_argument("-p", "--port", type=int, default=PORT,
+                    help="监听端口，默认 %d，被占用时自动往后找" % PORT)
+    ap.add_argument("--host", default=HOST, help="监听地址，默认 %s" % HOST)
+    ap.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
+    ap.add_argument("-v", "--version", action="version", version="wy-canvas " + VERSION)
+    a = ap.parse_args(argv)
+
+    # 0.0.0.0 只用于监听，探测/自检还得走回环地址
+    host = a.host
+    probe = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    show = "127.0.0.1" if host in ("0.0.0.0", "") else host
+
+    if port_busy(a.port, probe):
+        url = "http://%s:%d/" % (show, a.port)
+        if is_ours(a.port, probe):
+            print("\n  画布已经在 %s 跑着了，直接给你打开它。" % url)
+            if not a.no_browser:
+                webbrowser.open(url)
+            return 0
+        httpd, port = bind_server(host, a.port + 1)
+        if not httpd:
+            return 1
+        print("\n  ! 端口 %d 被别的程序占着，这次改用 %d。" % (a.port, port))
+    else:
+        httpd, port = bind_server(host, a.port)
+        if not httpd:
+            return 1
+
+    url = "http://%s:%d/" % (show, port)
+    banner(url, comfy_root())
+
+    if not a.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

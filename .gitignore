@@ -1,2 +1,15 @@
 .tmp/
 __pycache__/
+*.pyc
+
+# 本机 ComfyUI 路径（每台机器不同，不进仓库）
+comfy-root.txt
+
+# 打包产物
+dist/
+*.zip
+*.sha256
+
+# 编辑器
+.vscode/
+.idea/
