@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==========================================================
-#  wy-canvas launcher  (macOS / Linux)
+#  xy-wxhb launcher  (macOS / Linux)
 #
 #  和 start.bat 等价：找一个 3.8+ 的 Python，起本地服务，
 #  然后自动打开浏览器。
@@ -21,7 +21,7 @@ check_py() {
 }
 
 # 1. 环境变量
-[ -n "${WY_PYTHON:-}" ] && [ -x "$WY_PYTHON" ] && PY="$WY_PYTHON"
+[ -n "${XY_WXHB_PYTHON:-}" ] && [ -x "$XY_WXHB_PYTHON" ] && PY="$XY_WXHB_PYTHON"
 
 # 2. 随包携带的便携 Python
 check_py "./python/bin/python3"
@@ -46,7 +46,7 @@ if [ -z "$PY" ]; then
      Fedora:  sudo dnf install python3
 
    已经装在非标准位置的话，指定路径再启动：
-     WY_PYTHON=/opt/python3/bin/python3 ./start.sh
+     XY_WXHB_PYTHON=/opt/python3/bin/python3 ./start.sh
 EOF
   exit 1
 fi

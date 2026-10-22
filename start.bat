@@ -1,6 +1,6 @@
 @echo off
 rem ==========================================================
-rem  wy-canvas launcher  (Windows)
+rem  xy-wxhb launcher  (Windows)
 rem
 rem  Keep this file pure ASCII.
 rem  cmd parses a .bat in the ANSI codepage, so UTF-8 Chinese
@@ -8,16 +8,16 @@ rem  in here gets split into garbage and can break commands.
 rem  All Chinese hints are printed by serve.py instead.
 rem
 rem  Python is auto-detected in this order:
-rem    1. WY_PYTHON environment variable
+rem    1. XY_WXHB_PYTHON environment variable
 rem    2. python\python.exe next to this file (portable bundle)
 rem    3. the python that ships with your ComfyUI (via comfy-root.txt)
 rem    4. the py launcher (py -3)
 rem    5. python / python3 on PATH
 rem    6. a ComfyUI*/python folder on any local disk
-rem  Nothing found? Set WY_PYTHON or see the message at the end.
+rem  Nothing found? Set XY_WXHB_PYTHON or see the message at the end.
 rem ==========================================================
 setlocal EnableExtensions
-title wy-canvas
+title xy-wxhb
 cd /d "%~dp0"
 
 set "PYEXE="
@@ -57,7 +57,7 @@ if errorlevel 1 (
   echo           Detected: %PYEXE% %PYARG%
   "%PYEXE%" %PYARG% -V
   echo.
-  echo   Install a newer Python, or set WY_PYTHON to a 3.8+ python.exe
+  echo   Install a newer Python, or set XY_WXHB_PYTHON to a 3.8+ python.exe
   echo.
   pause
   exit /b 1
@@ -75,9 +75,9 @@ rem  probes
 rem ----------------------------------------------------------
 :use_env
 if defined PYEXE goto :eof
-if not defined WY_PYTHON goto :eof
-if not exist "%WY_PYTHON%" goto :eof
-set "PYEXE=%WY_PYTHON%"
+if not defined XY_WXHB_PYTHON goto :eof
+if not exist "%XY_WXHB_PYTHON%" goto :eof
+set "PYEXE=%XY_WXHB_PYTHON%"
 goto :eof
 
 :use_bundled
@@ -145,14 +145,14 @@ echo   ==========================================================
 echo    Python not found.
 echo   ==========================================================
 echo.
-echo    wy-canvas needs Python 3.8+ to serve its files locally.
+echo    xy-wxhb needs Python 3.8+ to serve its files locally.
 echo    Pick one of these:
 echo.
 echo      1) Install Python from https://www.python.org/downloads/
 echo         (tick "Add python.exe to PATH" during setup)
 echo.
 echo      2) If you already run ComfyUI, point straight at its python:
-echo             set WY_PYTHON=E:\ComfyUI_windows_portable\python_embeded\python.exe
+echo             set XY_WXHB_PYTHON=E:\ComfyUI_windows_portable\python_embeded\python.exe
 echo             start.bat
 echo.
 echo      3) Copy a portable python into this folder as:

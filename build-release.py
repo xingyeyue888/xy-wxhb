@@ -2,7 +2,7 @@
 build-release.py —— 打一个「解压即用」的绿色包
 
 用法：
-    python build-release.py                # dist/wy-canvas-v1.0.0.zip
+    python build-release.py                # dist/xy-wxhb-v1.0.0.zip
     python build-release.py --with-docs    # 连 docs/ 截图一起收（当前 README 未引用，默认不收）
     python build-release.py --out D:/tmp   # 换输出目录
 
@@ -87,13 +87,13 @@ def collect(with_docs=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="打包 wy-canvas 绿色版")
+    ap = argparse.ArgumentParser(description="打包 xy-wxhb 绿色版")
     ap.add_argument("--with-docs", action="store_true", help="连 docs/ 截图一起收（默认不收）")
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"), help="输出目录")
     a = ap.parse_args()
 
     ver = read_version()
-    top = "wy-canvas-v%s" % ver
+    top = "xy-wxhb-v%s" % ver
     os.makedirs(a.out, exist_ok=True)
     zip_path = os.path.join(a.out, "%s.zip" % top)
 
@@ -127,7 +127,7 @@ def main():
 
         # 解压后一眼能看懂的落地说明
         z.writestr(entry("%s/包内说明.txt" % top, 0o644), (
-            "wy-canvas v%s\r\n"
+            "xy-wxhb v%s\r\n"
             "\r\n"
             "1. 先把 ComfyUI 跑起来（默认 http://127.0.0.1:8188）\r\n"
             "2. Windows 双击 start.bat；macOS / Linux 执行 ./start.sh\r\n"

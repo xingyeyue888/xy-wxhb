@@ -1,4 +1,4 @@
-# 本地无限画布 · wy-canvas
+# 本地无限画布 · xy-wxhb
 
 把 ComfyUI 的工作流摆到一块无限画布上：**一个节点 = 一次生成**。素材、参数、LoRA、
 模型都摊在节点里改，跑完的结果自动接到旁边，可以继续往下喂。
@@ -23,11 +23,11 @@ v1.0.0 · MIT · Windows / macOS / Linux
 
 ### 方式一：下载绿色包（推荐，不用装任何东西）
 
-1. 到 [Releases](../../releases) 下载 `wy-canvas-v1.0.0.zip`，解压到任意目录
+1. 到 [Releases](../../releases) 下载 `xy-wxhb-v1.0.0.zip`，解压到任意目录
 2. Windows 双击 **`start.bat`**；macOS / Linux 执行 **`./start.sh`**
 3. 浏览器自动打开 `http://127.0.0.1:8277/`
 
-启动脚本会自己找 Python，按这个顺序：`WY_PYTHON` 环境变量 → 同目录的便携 Python →
+启动脚本会自己找 Python，按这个顺序：`XY_WXHB_PYTHON` 环境变量 → 同目录的便携 Python →
 **ComfyUI 整合包自带的 Python** → `py -3` → PATH 里的 `python` / `python3` → 扫一遍磁盘上的 `ComfyUI*/`。
 所以只要你机器上跑着 ComfyUI，通常什么都不用配。
 
@@ -35,7 +35,7 @@ v1.0.0 · MIT · Windows / macOS / Linux
 
 ```bash
 git clone <本仓库地址>
-cd wy-canvas
+cd xy-wxhb
 python serve.py          # 需要 Python 3.8+
 ```
 
@@ -65,7 +65,7 @@ python serve.py -v             # 看版本
 
 | 现象 | 原因与处理 |
 |---|---|
-| 双击后窗口一闪就没 | 没找到 Python。命令行里跑 `start.bat` 能看到具体提示；或先 `set WY_PYTHON=你的python.exe路径` 再启动 |
+| 双击后窗口一闪就没 | 没找到 Python。命令行里跑 `start.bat` 能看到具体提示；或先 `set XY_WXHB_PYTHON=你的python.exe路径` 再启动 |
 | 提示端口被占 | 会自动改用 8278、8279…，看控制台打印的地址即可；也可以 `-p` 指定 |
 | 页面能开，但一直「未连接」 | ComfyUI 没开，或地址不对。在顶栏输入框改完点「连接」 |
 | 素材库显示「未就绪」 | 没自动认出 ComfyUI 根目录。在素材库面板里手动选一次，之后会记住（存进 `comfy-root.txt`） |
@@ -181,7 +181,7 @@ python serve.py -v             # 看版本
   底下是文件下拉 + 「上传 / 停用」；停用的格底下多一行「未生效」。格子按类型分组排成网格、宽度自适应
   （节点 360px 默认宽 ≈ 3 列，拉到 600px ≈ 5 列），6 张参考图从「6 条整行」压成「2 行」。
 - **从素材库直接拖进格子**：素材库里点住一个文件，拖到任意一格里松手 = 给这一格换文件。
-  output 里的文件会自动复制一份进 `input/`（名字固定成 `wy_原名`，同一个素材反复拖只覆盖同一个文件，
+  output 里的文件会自动复制一份进 `input/`（名字固定成 `xy_原名`，同一个素材反复拖只覆盖同一个文件，
   input 不会被灌满）；类型对不上会直接提示，不会硬塞。
 - **有素材的槽才摆出来，空槽一律隐藏**：末尾一个 `＋ 参考图` 方框（跟素材格同宽），点一次露出一个空槽（下拉 / 上传随你）。
   池里还有工作流自带的空 `LoadImage`（值写成 `None` 那种）就先复用，用完了才由画布补一个新的加载节点。
@@ -219,7 +219,7 @@ python serve.py -v             # 看版本
 - 点素材卡 / LoRA 卡的 **「不启用」/「启用」**，会把这个节点的 `mode` 写回工作流文件
   （停用 = `mode 4` 紫旁路，跟手点 Ctrl+B 一样；启用 = `mode 0`），
   所以**从 ComfyUI 界面直接跑那个工作流也是同样的启停**，不会再「画布停了、ComfyUI 还在用」
-- 写盘前先备份到 `user/default/wy-canvas-backup/<工作流名>.<时间>.json`（每次会话每个工作流一份；
+- 写盘前先备份到 `user/default/xy-wxhb-backup/<工作流名>.<时间>.json`（每次会话每个工作流一份；
   同样写单行紧凑 JSON，跟被打回的那个文件排版一致，要回滚直接盖回去即可）
 - 🔴 **写完会回读校验**：ComfyUI 那一页正开着这份工作流时，它迟早会把内存里那份存回去盖掉我们写的，
   这时 toast 会直接说「写回被挤掉了」并自动补写一次；还是不行就把问题挂在 **LoRA 段标题**上
@@ -239,7 +239,7 @@ python serve.py -v             # 看版本
 > 更麻烦的是它再保存一次就会把画布的改动盖回去（画布会在 20 秒内发现并亮「没写回」）。
 > **推荐：改启停就在画布里改；画布上改完，在 ComfyUI 里重新打开那份工作流再看/再跑。**
 
-> 不想让画布碰你的工作流文件？F12 里执行 `localStorage["wy-canvas.pushmodes"]="0"` 再刷新，
+> 不想让画布碰你的工作流文件？F12 里执行 `localStorage["xy-wxhb.pushmodes"]="0"` 再刷新，
 > 之后就只读不写（`="1"` 或删掉这一项即恢复，默认是写）。
 
 ### 向前连线：从素材卡自己的端口往外拉
@@ -358,7 +358,7 @@ python serve.py -v             # 看版本
 > 为什么这块需要后端：ComfyUI 官方 HTTP 接口只有 `/view`（按文件名取文件），
 > **没有「列目录」和「删文件」**。所以 `serve.py` 直接读本机 `input/` `output/` 目录提供这些能力：
 > `GET /api/lib/root|projects|items`、`POST /api/lib/project|delete|collect|rename`、`DELETE /api/lib/file|project|dir`。
-> 它会自动探测 ComfyUI 根目录（`comfy-root.txt` → 环境变量 `WY_COMFY_ROOT` → 常见路径），
+> 它会自动探测 ComfyUI 根目录（`comfy-root.txt` → 环境变量 `XY_WXHB_COMFY_ROOT` → 常见路径），
 > 探不到就在面板里让你手填一次，记在 `comfy-root.txt` 里。所有路径都过越界校验，只动 `input/` `output/` 里面。
 
 ### 四种素材节点
@@ -399,7 +399,7 @@ python serve.py -v             # 看版本
 > 图片 / 视频 输入都能接，运行时会挑对应的那份产出。
 
 - 上游产物如果是 `output/` 或 `temp/` 里的文件，会先下载再重传进 `input/`，
-  文件名固定叫 `wy_<上游id>_<下游id>.<ext>`，重复跑只覆盖同一个文件，不会把 `input/` 灌满
+  文件名固定叫 `xy_<上游id>_<下游id>.<ext>`，重复跑只覆盖同一个文件，不会把 `input/` 灌满
 
 ### 改节点大小
 
@@ -541,7 +541,7 @@ python serve.py -v             # 看版本
 ## 文件
 
 ```
-wy-canvas/
+xy-wxhb/
 ├── index.html        结构（侧栏双页签 / 画布 / HUD）
 ├── css/style.css     样式（深色）
 ├── js/
@@ -553,7 +553,7 @@ wy-canvas/
 ├── start.bat         Windows 启动器（纯 ASCII，别往里写中文）
 ├── start.sh          macOS / Linux 启动器
 ├── VERSION           版本号（唯一来源，打包脚本和 serve.py 都读它）
-├── build-release.py  打绿色包：dist/wy-canvas-vX.Y.Z.zip + .sha256
+├── build-release.py  打绿色包：dist/xy-wxhb-vX.Y.Z.zip + .sha256
 ├── LICENSE           MIT
 ├── comfy-root.txt    ComfyUI 根目录（手动指定后生成，不进仓库）
 └── docs/             早期界面截图（当前 README 未引用，默认不打进发布包）
@@ -565,12 +565,12 @@ wy-canvas/
 
 ### 调试
 
-F12 里有一个调试入口 `__wy`：
+F12 里有一个调试入口 `__xy`：
 
 ```js
-__wy.S            // 全部状态：nodes / edges / workflows / oi
-__wy.view         // 画布实例：setPos / fitToContent / setView
-__wy.runNode(__wy.S.nodes[0])   // 手动跑某个节点
+__xy.S            // 全部状态：nodes / edges / workflows / oi
+__xy.view         // 画布实例：setPos / fitToContent / setView
+__xy.runNode(__xy.S.nodes[0])   // 手动跑某个节点
 ```
 
 ---
@@ -582,12 +582,12 @@ __wy.runNode(__wy.S.nodes[0])   // 手动跑某个节点
 打发布包（版本号只改 `VERSION` 一处）：
 
 ```bash
-python build-release.py        # dist/wy-canvas-vX.Y.Z.zip + .sha256
+python build-release.py        # dist/xy-wxhb-vX.Y.Z.zip + .sha256
 ```
 
 ## 许可
 
-[MIT](LICENSE) © 2026 wy-canvas contributors
+[MIT](LICENSE) © 2026 xy-wxhb contributors
 
 本项目没有引入任何前端框架、图标库或 Python 第三方包。
 ComfyUI 本身按 GPL-3.0 分发，这里只是通过它的 HTTP 接口调用，不包含其代码。
@@ -606,7 +606,7 @@ ComfyUI 本身按 GPL-3.0 分发，这里只是通过它的 HTTP 接口调用，
 - **临时产出**：`PreviewImage` 这种 `type=temp` 的结果会被 ComfyUI 清理掉，
   内容节点状态里会标「临时（会被 ComfyUI 清理，建议另存）」
 - 一个子库最多列 **400** 个文件（按修改时间倒序），太大的目录请分子库
-- 连线传图会在 `ComfyUI/input/` 下留 `wy_*.ext`；一个画布 + 一条线对应一个文件，
+- 连线传图会在 `ComfyUI/input/` 下留 `xy_*.ext`；一个画布 + 一条线对应一个文件，
   删节点不会自动删文件（去素材库的 input 里删即可）
 - 素材节点上传的文件保留原文件名，同名会被**覆盖**（`overwrite=true`）
 - **素材槽只对有 `COMFY_AUTOGROW_V3` 的节点生效**：像 `MiniMaxH3ImageToVideo` 只有
@@ -635,5 +635,5 @@ ComfyUI 本身按 GPL-3.0 分发，这里只是通过它的 HTTP 接口调用，
 - **「改不了」的名单是手写的**：`HIDDEN_WIDGETS` 覆盖的是本机这几个 H3 / 导演台系列的节点。
   别的插件如果也把自己的 widget 藏起来（前端 `computeSize` 压成 0），画布识别不出来，
   还是会给输入框 —— 遇到就往表里加一条
-- **画布补出来的加载节点写不回**：`wy_*` 这种临时加的 `LoadImage` 不在工作流文件里，
+- **画布补出来的加载节点写不回**：`xy_*` 这种临时加的 `LoadImage` 不在工作流文件里，
   停用/启用时只能作用于本次提交（toast 会提示「ComfyUI 文件里没有它」）

@@ -5,7 +5,7 @@
 ## 跑起来
 
 ```bash
-git clone <repo> && cd wy-canvas
+git clone <repo> && cd xy-wxhb
 python serve.py            # 需要 Python 3.8+
 ```
 
@@ -57,7 +57,7 @@ python serve.py            # 需要 Python 3.8+
 ## 打包
 
 ```bash
-python build-release.py            # dist/wy-canvas-vX.Y.Z.zip + .sha256
+python build-release.py            # dist/xy-wxhb-vX.Y.Z.zip + .sha256
 python build-release.py --no-docs  # 不带截图，体积小一半
 ```
 

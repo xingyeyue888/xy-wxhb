@@ -8,10 +8,10 @@ import { CanvasView } from "./canvas.js";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 
-const LS_KEY = "wy-canvas:v1";
+const LS_KEY = "xy-wxhb:v1";
 
 const S = {
-  base: localStorage.getItem("wy-canvas.base") || "http://127.0.0.1:8188",
+  base: localStorage.getItem("xy-wxhb.base") || "http://127.0.0.1:8188",
   oi: null,
   workflows: [],
   nodes: [],                    // 运行时节点对象
@@ -21,8 +21,8 @@ const S = {
   search: "",
   restoring: false,             // 正在从 localStorage 恢复节点
   lib: {                        // 素材库
-    tab: localStorage.getItem("wy-canvas.tab") || "wf",
-    kind: localStorage.getItem("wy-canvas.libkind") || "input",
+    tab: localStorage.getItem("xy-wxhb.tab") || "wf",
+    kind: localStorage.getItem("xy-wxhb.libkind") || "input",
     project: "",
     projects: [],
     items: [],
@@ -96,9 +96,9 @@ function init() {
 
   bindUI();
   /* 恢复界面级背景设置：日间标志在 localStorage；背景图在 IndexedDB（异步） */
-  applyDay(localStorage.getItem("wy-canvas.day") === "1");
+  applyDay(localStorage.getItem("xy-wxhb.day") === "1");
   /* 老版本把背景图存进过 localStorage，爆过配额——见到就清掉，把空间还给画布存档 */
-  localStorage.removeItem("wy-canvas.bgimg");
+  localStorage.removeItem("xy-wxhb.bgimg");
   bgIdb("get").then(bg => { if (bg) applyBgImg(bg); }).catch(() => { });
   restore();             // 先恢复画布
   connect();             // 再连 ComfyUI（连上后刷新工作流列表 + 恢复节点）
@@ -130,7 +130,7 @@ function bindUI() {
     const b = $("#btn-toggle-side");
     b.textContent = collapsed ? "»" : "«";
     b.title = (collapsed ? "展开" : "折叠") + "侧栏 (Ctrl+B)";
-    localStorage.setItem("wy-canvas.side", collapsed ? "1" : "0");
+    localStorage.setItem("xy-wxhb.side", collapsed ? "1" : "0");
     /* 侧栏宽度变了，画布可视区跟着变，线要重算 */
     requestAnimationFrame(() => view.scheduleEdges());
   };
@@ -138,12 +138,12 @@ function bindUI() {
   appEl.addEventListener("transitionend", (e) => {
     if (e.propertyName === "grid-template-columns") view.scheduleEdges();
   });
-  setSide(localStorage.getItem("wy-canvas.side") === "1");
+  setSide(localStorage.getItem("xy-wxhb.side") === "1");
 
   /* 侧栏页签：工作流 / 素材库 */
   const setTab = (tab) => {
     S.lib.tab = tab;
-    localStorage.setItem("wy-canvas.tab", tab);
+    localStorage.setItem("xy-wxhb.tab", tab);
     $$(".side-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     $("#pane-wf").classList.toggle("hide", tab !== "wf");
     $("#pane-lib").classList.toggle("hide", tab !== "lib");
@@ -155,7 +155,7 @@ function bindUI() {
     const b = e.target.closest("[data-libkind]");
     if (!b) return;
     S.lib.kind = b.dataset.libkind;
-    localStorage.setItem("wy-canvas.libkind", S.lib.kind);
+    localStorage.setItem("xy-wxhb.libkind", S.lib.kind);
     S.lib.project = "";
     S.lib.sel.clear();
     $$("#lib-kinds .chip").forEach(c => c.classList.toggle("active", c === b));
@@ -186,7 +186,7 @@ function bindUI() {
   $("#btn-connect").onclick = () => {
     S.base = $("#comfy-url").value.trim() || "http://127.0.0.1:8188";
     api.setBase(S.base);
-    localStorage.setItem("wy-canvas.base", S.base);
+    localStorage.setItem("xy-wxhb.base", S.base);
     connect();
   };
   $("#comfy-url").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-connect").click(); });
@@ -276,7 +276,7 @@ function bindUI() {
   });
   $("#stage").addEventListener("drop", (e) => {
     e.preventDefault();
-    const raw = e.dataTransfer?.getData("application/x-wy-lib");
+    const raw = e.dataTransfer?.getData("application/x-xy-lib");
     if (raw) {
       try { addLibNode(JSON.parse(raw), e.clientX, e.clientY); return; } catch { }
     }
@@ -553,13 +553,13 @@ async function addWorkflowNode(wf, at, autoRun = false) {
      · 读：刷新 / 点 ⟳ 一律读磁盘上的 <workflows>/xxx.json（api 层已禁用
            浏览器缓存），在 ComfyUI 里启用/停用 LoRA、改参数，画布能跟上；
      · 写：「不启用 / 启用」素材会把节点的 bypass(mode=4) / 正常(mode=0)
-           写回那个工作流文件，写之前先备份到 user/default/wy-canvas-backup/。
+           写回那个工作流文件，写之前先备份到 user/default/xy-wxhb-backup/。
 
    ⚠️ 双向同步的固有坑：ComfyUI 网页里正在编辑、还没按 Ctrl+S 的那一份
       不归我们管。写回磁盘后，那边再保存会把这次改动盖回去 —— 所以界面上
       给 ⚠ 提示，别在两个窗口里同时改同一个工作流。
 ================================================================== */
-const SYNC_PUSH_KEY = "wy-canvas.pushmodes";
+const SYNC_PUSH_KEY = "xy-wxhb.pushmodes";
 const syncCfg = { push: localStorage.getItem(SYNC_PUSH_KEY) !== "0" };
 
 /** 结构指纹：节点 id + 类型 + 启停模式，用来判断 ComfyUI 那边有没有变结构 */
@@ -615,7 +615,7 @@ function adoptWorkflow(node, uiWf, meta) {
 
   node.uiWf = uiWf;
   node.prompt = prompt;
-  /* 画布补出来的加载节点（wy_*）不在工作流文件里，先按记录重建，再合并参数 */
+  /* 画布补出来的加载节点（xy_*）不在工作流文件里，先按记录重建，再合并参数 */
   restoreExtraSlots(node);
   const { params, conflicts, dropped } = mergeParams(oldPrompt, node.params || {}, node.prompt);
   node.params = params;
@@ -633,7 +633,7 @@ function adoptWorkflow(node, uiWf, meta) {
      · 画布说停用、文件里是启用   → 保留，只标成「没写回」（LoRA 段会亮按钮，点一下补写）
      以前这里遇到第二种会把画布的状态丢掉「跟着文件走」——问题是 ComfyUI 那边
      自动保存会把我们写的 mode 盖回去，画布跟着一丢，就成了「点了不启用，过一会儿又自己亮了」。
-     画布补出来的加载节点（wy_*）不在文件里，原样留着。 */
+     画布补出来的加载节点（xy_*）不在文件里，原样留着。 */
   const modes = new Map((uiWf.nodes || []).map(n => [String(n.id), n.mode ?? 0]));
   const prev = node.wfModes || null;
   const ext = new Set((node.extraSlots || []).map(e => e.id));
@@ -690,7 +690,7 @@ async function backupWorkflowOnce(node, snapshot) {
   const p2 = (n) => String(n).padStart(2, "0");
   const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
   /* 备份也用紧凑 JSON：跟 ComfyUI 自己存的排版一致，回滚时格式不打架 */
-  await api.putUserFile(`wy-canvas-backup/${safe}.${stamp}.json`, JSON.stringify(snapshot));
+  await api.putUserFile(`xy-wxhb-backup/${safe}.${stamp}.json`, JSON.stringify(snapshot));
   backedUp.add(node.file);
 }
 
@@ -1994,7 +1994,7 @@ function injectLoader(node, kind, idx) {
   if (!field) return null;
   const inputs = {};
   for (const w of ws) if (w.default !== undefined) inputs[w.name] = w.default;
-  const id = "wy_" + kind + "_" + idx + "_" + Math.random().toString(36).slice(2, 5);
+  const id = "xy_" + kind + "_" + idx + "_" + Math.random().toString(36).slice(2, 5);
   node.prompt[id] = { class_type: cls, inputs, _meta: { title: `${KIND_NAME[kind]} ${idx + 1}` } };
   node.extraSlots = [...(node.extraSlots || []), { id, kind, idx, cls, field }];
   return { id, cls, field };
@@ -3328,7 +3328,7 @@ function slotZone(node, slots) {
    于是从素材库往「参考图 3」那一格拖，什么也不会发生。现在格子和素材节点
    自己接 drop：库里点住文件拖到格子上，就等于给这一格换文件。
 ================================================================== */
-const LIB_DND = "application/x-wy-lib";      // 和素材库 dragstart 写进去的是同一个 MIME
+const LIB_DND = "application/x-xy-lib";      // 和素材库 dragstart 写进去的是同一个 MIME
 
 /** 这一拖带的是「素材库条目 / 本地文件」吗（dragover 阶段读不到 data，只能看 types） */
 function isFileDrag(e) {
@@ -3350,7 +3350,7 @@ async function adoptLibFile(item) {
   const stem = (item.name.slice(0, item.name.length - ext.length) || "file")
     .replace(/[^\w\-.\u4e00-\u9fff]/g, "_").slice(0, 60);
   /* 名字固定住：同一个素材反复拖只覆盖同一个 input 文件，不会把 input 目录灌满 */
-  const f = new File([blob], `wy_${stem}${ext}`, { type: blob.type || "application/octet-stream" });
+  const f = new File([blob], `xy_${stem}${ext}`, { type: blob.type || "application/octet-stream" });
   return await api.uploadImage(f);
 }
 
@@ -3958,7 +3958,7 @@ function lockedKeysOf(node) {
 }
 
 /** 上游产出落到磁盘：output 里的取回来、重传一份进 input/；本来就在 input 的直接用。
-    文件名固定成 wy_<上游>_<下游>.ext —— 同一条边反复跑只会覆盖同一个文件 */
+    文件名固定成 xy_<上游>_<下游>.ext —— 同一条边反复跑只会覆盖同一个文件 */
 async function materializeUpstream(node, src, v, want) {
   if (v.direct) return v.filename;
   node.progress = `传入「${src.name}」的${WANT_CN[want] || "文件"}…`;
@@ -3966,7 +3966,7 @@ async function materializeUpstream(node, src, v, want) {
   const blob = await api.fetchBlob(v);
   const ext = (v.filename.match(/\.[a-z0-9]+$/i) || [".png"])[0];
   const tag = `${src.id}_${node.id}`.replace(/[^a-z0-9_-]/gi, "");
-  const file = new File([blob], `wy_${tag}${ext}`, { type: blob.type || "application/octet-stream" });
+  const file = new File([blob], `xy_${tag}${ext}`, { type: blob.type || "application/octet-stream" });
   return api.uploadImage(file);
 }
 
@@ -4904,7 +4904,7 @@ function libItemCard(it) {
 
   el.addEventListener("dragstart", (e) => {
     if (e.target.closest(".li-pick")) { e.preventDefault(); return; }   // 别把勾选拖成拖拽
-    e.dataTransfer.setData("application/x-wy-lib", JSON.stringify({
+    e.dataTransfer.setData("application/x-xy-lib", JSON.stringify({
       name: it.name, sub: it.sub || "", kind: it.kind, type: kind, size: it.size,
     }));
     e.dataTransfer.setData("text/plain", it.name);
@@ -5345,13 +5345,13 @@ async function resumeNodes() {
 ================================================================== */
 function applyDay(on) {
   document.body.classList.toggle("day", !!on);
-  localStorage.setItem("wy-canvas.day", on ? "1" : "0");
+  localStorage.setItem("xy-wxhb.day", on ? "1" : "0");
   $("#btn-day").classList.toggle("active", !!on);
   view.scheduleEdges();   // 线色跟着变量走，重画一次
 }
 
 /* ---- IndexedDB 小helper：只服务背景图 ---- */
-const BG_DB = "wy-canvas-bg";
+const BG_DB = "xy-wxhb-bg";
 function bgIdb(mode, val) {
   return new Promise((res, rej) => {
     const rq = indexedDB.open(BG_DB, 1);
@@ -5439,7 +5439,7 @@ function shrinkImage(dataUrl) {
 function exportCanvas() {
   const at = new Map(S.nodes.map((n, i) => [n.id, i]));
   const data = {
-    app: "wy-canvas", v: 2,
+    app: "xy-wxhb", v: 2,
     nodes: S.nodes.map(n => ({
       kind: n.kind, file: n.file, name: n.name, wfKind: n.wfKind,
       inKind: n.inKind, value: n.value, sub: n.sub, sType: n.sType,
@@ -5525,8 +5525,8 @@ async function importCanvas(e) {
   e.target.value = "";
 }
 
-/* 调试钩子：F12 里敲 __wy.S / __wy.view 就能看当前状态，排查问题用 */
-window.__wy = {
+/* 调试钩子：F12 里敲 __xy.S / __xy.view 就能看当前状态，排查问题用 */
+window.__xy = {
   S,
   save,
   renderNode,

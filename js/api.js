@@ -107,7 +107,7 @@ export async function putUserFile(relPath, text) {
 }
 
 /* ---------------- 执行 ---------------- */
-export async function submit(prompt, clientId = "wy-canvas") {
+export async function submit(prompt, clientId = "xy-wxhb") {
   const r = await req("/api/prompt", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

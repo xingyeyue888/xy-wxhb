@@ -49,8 +49,8 @@ def _read_version():
 
 
 VERSION = _read_version()
-PORT = int(os.environ.get("WY_CANVAS_PORT", "8277"))
-HOST = os.environ.get("WY_CANVAS_HOST", "127.0.0.1")
+PORT = int(os.environ.get("XY_WXHB_PORT", "8277"))
+HOST = os.environ.get("XY_WXHB_HOST", "127.0.0.1")
 
 KINDS = ("input", "output")
 
@@ -84,7 +84,7 @@ def _load_cfg_root():
 
 def _candidates():
     out = []
-    env = os.environ.get("WY_COMFY_ROOT", "").strip()
+    env = os.environ.get("XY_WXHB_COMFY_ROOT", "").strip()
     if env:
         out.append(env)
     cfg = _load_cfg_root()
@@ -255,7 +255,7 @@ def lib_rename(kind, sub, name, to):
     dst = safe_join(base, new + ext)
     if dst.lower() == src.lower():                 # 只改了大小写，仍要真的改
         if dst != src:
-            tmp = safe_join(base, "_wy_rename_tmp_" + name)
+            tmp = safe_join(base, "_xy_rename_tmp_" + name)
             os.rename(src, tmp)
             os.rename(tmp, dst)
             return {"ok": True, "name": new + ext, "from": name}
@@ -612,7 +612,7 @@ def main(argv=None):
                     help="监听端口，默认 %d，被占用时自动往后找" % PORT)
     ap.add_argument("--host", default=HOST, help="监听地址，默认 %s" % HOST)
     ap.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
-    ap.add_argument("-v", "--version", action="version", version="wy-canvas " + VERSION)
+    ap.add_argument("-v", "--version", action="version", version="xy-wxhb " + VERSION)
     a = ap.parse_args(argv)
 
     # 0.0.0.0 只用于监听，探测/自检还得走回环地址
