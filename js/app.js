@@ -1165,11 +1165,44 @@ async function flushParamPushInner(node, items) {
     pushToast(node, names.length === 1
       ? `已写回 ComfyUI：「${names[0]}」`
       : `已写回 ComfyUI：${names.slice(0, 3).join("、")}${names.length > 3 ? ` 等 ${names.length} 项` : ""}`, "ok");
+    watchOverwrite(node, applied);
     return { ok: 1, count: names.length };
   } catch (e) {
     pushToast(node, `写回 ComfyUI 失败：${e.message}`, "err");
     return { error: 1 };
   }
+}
+
+/* ==================================================================
+   写进去了，但被 ComfyUI 自己盖回来
+   ──────────────────────────────────────────────────────────────────
+   ComfyUI 的设置里有一条 Comfy.Workflow.AutoSave（默认 "after delay"、3 秒）：
+   那一页开着这份工作流时，它会把**内存里那份整图**写回文件。画布刚写进去的值
+   就这么被它内存里的旧值盖掉 —— 用户看到的是「改了没反应」，其实写进去过。
+
+   所以写完 5 秒后复查一次：这一格还是我写的那个值就没事；被打回旧值就直说原因，
+   别让人一趟趟重试。画布上要是又改过了，就当我们自己后写的，不算被盖。
+================================================================== */
+function watchOverwrite(node, applied) {
+  setTimeout(async () => {
+    try {
+      const wf = await api.getWorkflow(node.file).catch(() => null);
+      if (!wf) return;
+      const lost = applied.filter(it => {
+        const k = it.nid + "|" + it.field;
+        /* 画布上后来又改过这一格 → 以画布为准，不报 */
+        if (node.params && Object.prototype.hasOwnProperty.call(node.params, k)
+          && !sameVal(node.params[k], it.value)) return false;
+        const nd = (wf.nodes || []).find(n => String(n.id) === it.nid);
+        if (!nd) return false;
+        const got = readFieldValue(wf, it.nid, it.field);
+        return !(sameVal(got, it.value) || sameVal(normWidget(nd.type, it.field, got), it.value));
+      });
+      if (!lost.length) return;
+      const who = lost.map(it => node._cn?.[it.nid + "|" + it.field] || it.field).slice(0, 3).join("、");
+      toast(`「${who}」写进去后被 ComfyUI 的自动保存盖回旧值了 —— 在 ComfyUI 里重新打开这份工作流（或关掉它的自动保存），再改一次`, "err", 9000);
+    } catch { }
+  }, 5200);
 }
 
 /** 文本节点的内容 → 它连着的那些工作流输入口（提示词就是这么同步进 ComfyUI 的） */
