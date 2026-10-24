@@ -1298,6 +1298,10 @@ function buildFields(node) {
     const locks = lockMapOf(nd.class_type, effInputs(node, nodeId, nd));
     const title = nd._meta?.title || nd.class_type;
     const inlined = nd._meta?.inlined || {};
+    /* 内联常量原本是什么类型（PrimitiveFloat / PrimitiveInt…）。
+       没有它就是「不是内联常量」，按宽松浮点处理 —— 宁可让用户输 12.2，
+       也不要因为值恰好是整数就把他后来的小数吞掉 */
+    const inlType = nd._meta?.inlinedType || {};
     /* object_info 里声明过的输入名；widget 名单独留一份 —— autogrow 容器（values / ref_images）
        本身是声明过的，但它底下的 values.a 才是真正能改的那个数 */
     const widgets = listWidgets(info);
@@ -1340,11 +1344,18 @@ function buildFields(node) {
       const t = inlined[k] || title;
       /* 数学节点的 a / b 操作数：标题里认不出含义的，摆出来只会误导 */
       if (/^[a-z]$/i.test(k) && semName({ name: k, title: t, fromPrim: !!inlined[k] }) === k) continue;
+      /* 数值型：只有当源节点明确是「整数」时才当 INT，其余一律按浮点。
+         以前是 Number.isInteger(v) ? INT : FLOAT —— 时长 15 看着像整数，
+         这一格就成了 INT，输入框里敲 12.2 被 parseInt 砍成 12 */
+      const srcTy = String(inlType[k] || "");
+      const numTy = (srcTy === "INT" || /PrimitiveInt\b/i.test(srcTy)) ? "INT" : "FLOAT";
       out.push({
         key: nodeId + "|" + k, nodeId, name: k,
-        type: typeof v === "number" ? (Number.isInteger(v) ? "INT" : "FLOAT")
+        type: typeof v === "number" ? numTy
           : typeof v === "boolean" ? "BOOLEAN" : "STRING",
         choices: null, value: v,
+        /* 这类口的值不是节点自己声明的 widget，别拿 INT 的规矩去截它的小数 */
+        loose: typeof v === "number",
         title: t, cls: nd.class_type,
         locked: locks[k] || "",
         fromPrim: !!inlined[k],
@@ -2098,13 +2109,16 @@ function fieldControl(f, node, opt) {
     if (f.min !== undefined) inp.min = f.min;
     if (f.max !== undefined) inp.max = f.max;
     if (f.step !== undefined) inp.step = f.step;
+    else if (f.type === "FLOAT") inp.step = "any";      // 不设的话默认 step=1，12.2 会被当成非法步长
     /* 浮点尾巴太脏（0.7000000000000002）—— 只修显，不动实际值 */
     inp.value = typeof cur === "number" && !Number.isInteger(cur)
       ? String(parseFloat(cur.toFixed(6))) : (cur ?? 0);
     const readNum = () => {
       const raw = String(inp.value ?? "").trim();
       if (raw === "") return undefined;                  // 正在删空，先别写个 0 出去
-      const v = f.type === "INT" ? parseInt(raw, 10) : parseFloat(raw);
+      /* loose = 接线喂进来的常量（时长这类）。它不是节点声明的 INT 格子，
+         用户敲 12.2 就得原样留下 —— 以前按 INT 走 parseInt，0.2 秒静默蒸发 */
+      const v = (f.type === "INT" && !f.loose) ? parseInt(raw, 10) : parseFloat(raw);
       return Number.isFinite(v) ? v : undefined;         // 「-」「1.」这种半截先不管
     };
     /* 边敲边记：敲完不用回车，停手 3 秒自己写回 ComfyUI */
@@ -4546,7 +4560,10 @@ async function runNode(node, _seen = new Set()) {
     }
 
     /* 内联来源只给面板看，不进提交体 */
-    for (const nd of Object.values(prompt)) if (nd?._meta?.inlined) delete nd._meta.inlined;
+    for (const nd of Object.values(prompt)) {
+      if (nd?._meta?.inlined) delete nd._meta.inlined;
+      if (nd?._meta?.inlinedType) delete nd._meta.inlinedType;
+    }
     /* 传素材、算上游那段时间里点过「停止」：到这儿就别提交了 */
     if (node._stopping) throw new Error("已取消");
     const id = await api.submit(expandPromptTokens(prompt));

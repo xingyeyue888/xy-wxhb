@@ -173,7 +173,7 @@ export function convertWorkflow(ui, objectInfo) {
       const v = Array.isArray(n.widgets_values) ? n.widgets_values[0] : n.widgets_values;
       /* 记下这个常数是从哪个节点来的：内联之后节点就没了，
          面板上只剩一个孤零零的数（时长 10.1），没人知道它是「Float (duration)」 */
-      return { value: v, from: n.title || n.type };
+      return { value: v, from: n.title || n.type, srcType: n.outputs?.[0]?.type || n.type };
     }
     if (n.type === "Reroute") {
       const lk = (n.inputs || [])[0]?.link;
@@ -219,6 +219,9 @@ export function convertWorkflow(ui, objectInfo) {
     const inputs = {};
     /* 内联常量的来源（输入名 → 原节点标题）：只用于面板显示，不进 API */
     const inlinedFrom = {};
+    /* 顺带记下源节点类型（PrimitiveFloat / PrimitiveInt…）：面板要靠它判这一格
+       能不能存小数。光看「当前值是不是整数」会把 15 认成 INT，用户输 12.2 就被截成 12 */
+    const inlinedType = {};
 
     /* ---- widget 值 ----
        两套数据二选一，绝不混用下标：
@@ -286,10 +289,12 @@ export function convertWorkflow(ui, objectInfo) {
          在 API 侧就是扁平点号键，实测 ComfyUI 只认这种形态 */
       inputs[rawName] = val;
       if (res && typeof res === "object" && res.from) inlinedFrom[rawName] = res.from;
+      if (res && typeof res === "object" && res.srcType) inlinedType[rawName] = String(res.srcType);
     }
 
     const meta = { title: n.title || type };
     if (Object.keys(inlinedFrom).length) meta.inlined = inlinedFrom;
+    if (Object.keys(inlinedType).length) meta.inlinedType = inlinedType;
     prompt[String(n.id)] = { class_type: type, inputs, _meta: meta };
   }
 
