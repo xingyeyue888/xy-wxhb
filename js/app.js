@@ -3568,6 +3568,24 @@ function zoneFlows(node, zone) {
   };
 }
 
+/* 折叠区是开是合：人自己点过的记下来（刷新照旧），没点过就一律收起 ——
+   拖进去的格子自动藏起来，不占地方 */
+function foldOpenOf(node, zone) {
+  const rec = S.orders?.[orderKeyOf(node)] || {};
+  const m = rec.foldOpen;
+  return m && typeof m === "object" ? m[zone] : undefined;
+}
+
+function setFoldOpen(node, zone, open) {
+  const k = orderKeyOf(node);
+  if (!k) return;
+  S.orders = S.orders || {};
+  const o = S.orders[k] || (S.orders[k] = {});
+  if (!o.foldOpen || typeof o.foldOpen !== "object") o.foldOpen = {};
+  o.foldOpen[zone] = !!open;
+  save();
+}
+
 /* 区内容器 = 主区一片 + 「更多参数」折叠区。
    主区平铺全部格子；不常用又舍不得删的，拖进折叠区就收起来（还能拖回来）。
    顺序和归属都记在 S.orders 里：zone 存主区顺序，zone+"Fold" 存折叠区顺序
@@ -3602,8 +3620,14 @@ function fieldFlow(node, fields, zone, tagOf) {
     fw.appendChild(empty);
   }
   box.appendChild(fw);
-  /* 已经折了东西就默认展开：收起来会让人以为参数丢了 */
-  if (fold.length) box.open = true;
+  /* 折进去就收起来 —— 这才是「折叠」的意思。
+     以前是「有东西就展开」，等于把格子从主区挪到区块底部继续摊着，一点地方没省。
+     只有人自己点开过的那一区才展开（开合状态记在 S.orders，刷新照旧） */
+  if (foldOpenOf(node, zone) === true) box.open = true;
+  sum.addEventListener("click", () => {
+    /* 下一帧再读：details 的 open 是浏览器在 click 之后才翻的 */
+    setTimeout(() => setFoldOpen(node, zone, box.open), 0);
+  });
 
   attachFieldSort(wrap, node, zone, box);
   attachFieldSort(fw, node, zone, box);
@@ -3650,8 +3674,12 @@ function attachFieldSort(wrap, node, zone, foldBox) {
     wrap.classList.remove("drop-deny", "drop-end");
     if (foldBox) foldBox.classList.remove("drop-into");
     nodeEl(node)?.classList.remove("field-dragging");
-    /* 折叠区里没东西就收起来，别白占一块地方 */
-    if (foldBox && !foldBox.querySelector(":scope > .field-flow > .field")) foldBox.open = false;
+    /* 拖完把折叠区放回它该有的样子：人没点开过就收起（拖进去＝藏起来），
+       点开过的保持展开；拖空了当然收起 */
+    if (foldBox) {
+      const has = !!foldBox.querySelector(":scope > .field-flow > .field");
+      foldBox.open = has && foldOpenOf(node, zone) === true;
+    }
     dragField = null;
   });
 
@@ -3909,8 +3937,12 @@ function renderNode(node) {
 
 
     /* ③ LoRA：名字在上面、强度紧贴在这条下面，一眼看出哪个强度配的哪个 LoRA */
-    const loraOrder = [];
-    for (const f of g.lora) if (!loraOrder.includes(f.nodeId)) loraOrder.push(f.nodeId);
+    const loraIds = [];
+    for (const f of g.lora) if (!loraIds.includes(f.nodeId)) loraIds.push(f.nodeId);
+    /* 卡的顺序 = 叠加链的顺序（链头在最上），不是节点 id 的顺序。
+       按 id 排的时候，在 ComfyUI 里刚插到链首的新 LoRA 往往 id 最大，
+       就掉到最末一格，看着像「根本没同步进来」 */
+    const loraOrder = orderLorasByChain(node, loraIds, stg);
     /* ComfyUI 里被旁路的 LoRA 不进 prompt，画布上原本整个看不见。
        现在补成「已停用」的卡：看得见、点得到启用，不用回 ComfyUI 按 Ctrl+B */
     const dormant = dormantLoras(node);
@@ -4012,6 +4044,43 @@ function loraSyncChip(node) {
     pushModesToComfy(node);
   };
   return b;
+}
+
+/**
+ * LoRA 卡按「叠加链」排：链头最上，顺着 model 口一节一节往下接。
+ * 以前按节点 id 排 —— 在 ComfyUI 里刚插到链首的新 LoRA（比如 dmad 加速）
+ * 往往 id 最大，就掉到最末一格，看着像「根本没同步进来」。
+ * 叠加链的先后是真会影响出图的，画布上必须照实排。
+ */
+function orderLorasByChain(node, ids, stg) {
+  const list = ids || [];
+  const p = node?.prompt || {};
+  const set = new Set(list.map(String));
+  if (set.size < 2) return list.slice();
+  /* 图深度：从 UNET 那一头算起，越靠上游越小。
+     不能只数「往上几节 LoRA」—— 两条链从不同节点分出来时，
+     两个链头都是 0，在 ComfyUI 里插在最前面的那一节反而会被排到后面 */
+  const dep = new Map();
+  const depthOf = (id) => {
+    if (dep.has(id)) return dep.get(id);
+    dep.set(id, 0);                       /* 占位挡环 */
+    let d = 0;
+    for (const v of Object.values(p[id]?.inputs || {})) {
+      if (!Array.isArray(v) || typeof v[0] !== "string" || !p[v[0]]) continue;
+      d = Math.max(d, depthOf(v[0]) + 1);
+    }
+    dep.set(id, d);
+    return d;
+  };
+  const at = new Map(list.map((id, i) => [String(id), i]));
+  const stageOf = (id) => (stg && stg.get(String(id))) || 0;
+  return list.slice().sort((a, b) => {
+    const A = String(a);
+    const B = String(b);
+    return (stageOf(A) - stageOf(B))     /* 一采那套在前、二采在后 */
+      || (depthOf(A) - depthOf(B))       /* 同一道里按上游到下游 */
+      || (at.get(A) - at.get(B));        /* 深度相同就按原来的先后 */
+  });
 }
 
 /* LoRA 卡的小型化：叠加链的顺序不能动（改了就换出图结果），但占的地方可以省。
