@@ -26,6 +26,7 @@ import http.server
 import json
 import os
 import posixpath
+import shlex
 import shutil
 import socket
 import socketserver
@@ -424,11 +425,21 @@ def lib_delete_dir(kind, sub):
 # 浏览器没有「运行本机程序」的权限，所以这件事只能由本地服务来做：
 # 画布点一下 → 这里 subprocess 起进程 → 画布轮询 8188 等它就绪。
 #
+# ⚠️ 这个按钮只管「ComfyUI 自己的启动文件」。
+#    秋叶绘世、启动台这类第三方启动器不归它管 —— 那种点开只是把启动器窗口叫出来，
+#    真正启动还得在窗口里再点一下，等于点两下才出一个 ComfyUI。
+#    用第三方启动器的人自己起，画布连的是端口（8188），不需要知道谁把 ComfyUI 拉起来的。
+#
 # 绑定关系存用户目录，不跟着仓库走：换一份画布副本、清空 localStorage 都不用重绑。
 LAUNCH_CFG = os.path.join(os.path.expanduser("~"), ".xy-wxhb-launcher.json")
 
-# 只认这几种。别的一律不执行 —— 这个接口只做「运行你绑定的那一个文件」
-LAUNCH_EXT = (".bat", ".cmd", ".exe", ".lnk")
+# 只认这几种。别的一律不执行 —— 这个接口只做「运行你绑定的那一个文件」。
+# .py 是给整合包留的：绘世这类没有 run_*.bat，ComfyUI 的启动入口就是 main.py，
+# 得用它旁边的 python 跑（见 launch_python）。
+LAUNCH_EXT = (".bat", ".cmd", ".exe", ".lnk", ".py")
+
+# main.py 直接跑默认要带的参数：画布在另一个端口，跨源取 /view、/api 必须有 CORS 头
+PY_ARGS = "--enable-cors-header *"
 
 # 选择框必须另开一个进程跑 tkinter：HTTP 请求线程里建 Tk 会报
 # "main thread is not in main loop"，而且对话框一弹就把那个线程占死了。
@@ -441,21 +452,81 @@ except Exception as e:
     sys.stdout.write("ERR:" + str(e)); sys.exit(0)
 r = tk.Tk(); r.withdraw(); r.attributes("-topmost", True)
 p = filedialog.askopenfilename(
-    title="选择 ComfyUI 的启动文件（.bat / .exe / .lnk）",
-    filetypes=[("启动文件", "*.bat *.cmd *.exe *.lnk"), ("所有文件", "*.*")])
+    title="选择 ComfyUI 自己的启动文件（run_nvidia_gpu.bat 或 main.py）",
+    filetypes=[("ComfyUI 启动文件", "*.bat *.cmd *.exe *.lnk *.py"), ("所有文件", "*.*")])
 r.destroy()
 sys.stdout.write(p or "")
 '''
 
 
-def launch_kind(p):
-    """绑的是「启动器」还是「ComfyUI 本身」。
-    秋叶绘世这类第三方启动器：点开只是把启动器窗口叫出来，
-    ComfyUI 还得在启动器里点一下 —— 提示语得分开说，否则人会干等着。"""
-    b = os.path.basename(p or "").lower()
-    if any(k in b for k in ("启动器", "绘世", "launcher", "启动台")):
-        return "launcher"
-    return "app"
+def launch_python(comfy_dir):
+    """跑 main.py 要用的 python：整合包里它就在 ComfyUI 的上一级。
+    找不到就返回 "" —— 那就别硬跑，报错让人自己用启动器开。"""
+    d = os.path.abspath(comfy_dir or "")
+    for up in (os.path.dirname(d), d):      # E:\xxx\python  或  E:\xxx\ComfyUI\python
+        for sub in ("python", "python_embeded"):
+            p = os.path.join(up, sub, "python.exe")
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def launch_py_args(comfy_dir):
+    """跑 main.py 时带什么参数。
+
+    整合包里「启动 ComfyUI 用哪套参数」本来就有人调过 —— 绘世启动器记在
+    .launcher/preference.json 的 args.extra_args 里（--use-sage-attention
+    --cuda-malloc 这些，丢了出图会明显变慢）。这里沿用它，读不到才退回只有
+    跨源头的默认值。注意：读的是参数，不是让第三方启动器去启动。"""
+    d = os.path.abspath(comfy_dir or "")
+    for pre in (os.path.join(os.path.dirname(d), ".launcher", "preference.json"),
+                os.path.join(d, ".launcher", "preference.json")):
+        try:
+            with open(pre, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        a = str((cfg.get("args") or {}).get("extra_args") or "").strip()
+        if a:
+            if "enable-cors-header" not in a:
+                a += " --enable-cors-header *"
+            return a
+    return PY_ARGS
+
+
+def _read_head(p, n=4000):
+    try:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(n)
+    except Exception:
+        return ""
+
+
+def launch_find():
+    """自动找 ComfyUI 自己的启动文件。找不到给 ""。
+    整合包（portable）是根目录下的 run_nvidia_gpu.bat；绘世这类没有 bat，
+    启动入口就是 ComfyUI\\main.py —— 那就返回 main.py，用旁边自带的 python 跑。"""
+    root = comfy_root()
+    if not root:
+        return ""
+    root = os.path.abspath(root)
+    up = os.path.dirname(root)
+    for d in (up, root):                    # 先看整合包根目录，再看 ComfyUI 里面
+        try:
+            names = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for n in names:
+            if not n.lower().endswith((".bat", ".cmd")):
+                continue
+            full = os.path.join(d, n)
+            low = n.lower()
+            if low.startswith("run_") or "main.py" in _read_head(full).lower():
+                return full
+    mp = os.path.join(root, "main.py")
+    if os.path.isfile(mp) and launch_python(root):
+        return mp
+    return ""
 
 
 def launch_cfg():
@@ -465,19 +536,25 @@ def launch_cfg():
     except Exception:
         d = {}
     p = str(d.get("path") or "").strip()
-    return {"path": p, "exists": bool(p) and os.path.exists(p), "kind": launch_kind(p)}
+    args = str(d.get("args") or "").strip()
+    return {"path": p, "args": args,
+            "exists": bool(p) and os.path.exists(p),
+            "suggest": "" if p else launch_find()}
 
 
-def launch_bind(path):
+def launch_bind(path, args=None):
     path = (path or "").strip().strip('"')
     if not path:
         raise ValueError("路径是空的")
     if not os.path.isfile(path):
         raise ValueError("这个文件不存在：" + path)
     if os.path.splitext(path)[1].lower() not in LAUNCH_EXT:
-        raise ValueError("只支持 .bat / .cmd / .exe / .lnk")
+        raise ValueError("只支持 .bat / .cmd / .exe / .lnk / .py")
+    if args is None:
+        args = launch_py_args(os.path.dirname(path)) if path.lower().endswith(".py") else ""
     with open(LAUNCH_CFG, "w", encoding="utf-8") as f:
-        json.dump({"path": path, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+        json.dump({"path": path, "args": args,
+                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")},
                   f, ensure_ascii=False, indent=1)
     return launch_cfg()
 
@@ -495,7 +572,7 @@ def launch_run():
     cfg = launch_cfg()
     p = cfg["path"]
     if not p:
-        raise ValueError("还没绑定启动文件")
+        raise ValueError("还没绑定 ComfyUI 的启动文件")
     if not cfg["exists"]:
         raise ValueError("绑定的文件不在了：" + p)
     ext = os.path.splitext(p)[1].lower()
@@ -505,6 +582,15 @@ def launch_run():
     elif ext in (".bat", ".cmd"):
         # 单开一个控制台窗口，别把服务卡在子进程上；start 让 bat 自己跑
         subprocess.Popen(["cmd", "/c", "start", "", p], cwd=d, shell=False)
+    elif ext == ".py":
+        py = launch_python(d)
+        if not py:
+            raise ValueError("跑 " + os.path.basename(p)
+                             + " 要 ComfyUI 自带的 python，但没在它旁边找到 python\\python.exe")
+        args = cfg["args"] or launch_py_args(d)
+        # 新开一个控制台：ComfyUI 的加载日志得有地方看
+        subprocess.Popen([py, "-s", p] + shlex.split(args), cwd=d,
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
     else:
         subprocess.Popen([p], cwd=d)
     return {**cfg, "started": True}
@@ -555,6 +641,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ---------- 路由 ----------
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/health":
+            # 谁在跑、跑的哪一版：start.bat 靠它判断「8277 上那个是不是旧代码」
+            return self._json({"ok": True, "app": "xy-wxhb", "v": VERSION,
+                               "python": sys.version.split()[0]})
         if u.path.startswith("/api/lib/"):
             return self._lib_get(u)
         if u.path.startswith("/api/launch"):
@@ -563,6 +653,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/quit":
+            # 让位用：同一版代码的另一份要在原端口起来，先请这一份退场
+            self._json({"ok": True, "bye": True})
+            threading.Thread(target=_quit_after_flush, daemon=True).start()
+            return
         if u.path.startswith("/api/lib/"):
             return self._lib_post(u)
         if u.path.startswith("/api/launch"):
@@ -590,8 +685,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             if tail == "pick":                   # 弹系统选择框，返回选中的路径
                 return self._json({"ok": True, "path": launch_pick()})
-            if tail == "bind":                   # 手填路径也认
-                return self._json({"ok": True, **launch_bind(self._body().get("path"))})
+            if tail == "bind":                   # 手填路径也认；不传 args 就按 .py 自动补 CORS
+                b = self._body()
+                return self._json({"ok": True, **launch_bind(b.get("path"), b.get("args"))})
             if tail == "run":                    # 启动已绑定的那个文件
                 return self._json({"ok": True, **launch_run()})
             return self._json({"error": "not found"}, 404)
@@ -692,6 +788,92 @@ def is_ours(port, host=None):
         return False
 
 
+def remote_version(port, host=None):
+    """端口上那个服务的版本号。拿不到就返回 ""（老版本没有 /api/health 这个口）。
+
+    为什么要问：画布复用旧进程时，静态文件是从磁盘现取的（所以页面是新的），
+    但后端跑的还是它启动那会儿的代码 —— 新加的接口一律 404。
+    表现就是「按钮点了说本地服务没响应」，而人明明重启过 start.bat。"""
+    url = "http://%s:%d/api/health" % (host or HOST, port)
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(url, timeout=1.2) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return str(d.get("v") or "") if isinstance(d, dict) and d.get("app") == "xy-wxhb" else ""
+    except Exception:
+        return ""
+
+
+def _run_quiet(cmd, timeout=8):
+    """跑一条系统命令，别在 Windows 上闪黑框"""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              errors="ignore",
+                              creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                             if os.name == "nt" else 0)).stdout
+    except Exception:
+        return ""
+
+
+def listening_pid(port):
+    """谁在监听这个端口。拿不到就给 0"""
+    if os.name == "nt":
+        for ln in _run_quiet(["netstat", "-ano", "-p", "TCP"], 6).splitlines():
+            p = ln.split()
+            if len(p) >= 5 and p[-2].upper() == "LISTENING" and p[1].endswith(":%d" % port):
+                try:
+                    return int(p[-1])
+                except ValueError:
+                    return 0
+        return 0
+    out = _run_quiet(["lsof", "-nP", "-ti", "tcp:%d" % port, "-s", "TCP:LISTEN"], 6)
+    return int(out.split()[0]) if out.split() else 0
+
+
+def take_over(port, host=None):
+    """请走端口上那个旧版画布，好让这一版占回原端口。
+
+    为什么非要赶它走：静态文件是现取的（页面永远是新的），后端却是它启动那会儿的代码，
+    新加的接口一律 404 —— 表现就是「按钮点了说本地服务没响应，可重开 start.bat 也没用」，
+    因为 start.bat 一探到 8277 上「是画布」就直接复用，压根不会重启。
+    两步：能好好说就好好说（新版有 /api/quit）；说不通就按 PID 结束 ——
+    is_ours() 已经确认过那是自家进程，不是别人的东西。"""
+    h = host or HOST
+    try:
+        req = urllib.request.Request("http://%s:%d/api/quit" % (h, port), data=b"{}",
+                                     method="POST",
+                                     headers={"Content-Type": "application/json"})
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(req, timeout=1.5) as r:
+            r.read()
+    except Exception:
+        pass                                    # 旧版压根没这个口令，直接进下一步
+    for _ in range(24):
+        if not port_busy(port, h):
+            return True
+        time.sleep(0.15)
+    pid = listening_pid(port)
+    if pid:
+        if os.name == "nt":
+            _run_quiet(["taskkill", "/PID", str(pid), "/F"])
+        else:
+            try:
+                os.kill(pid, 15)                # SIGTERM
+            except Exception:
+                pass
+    for _ in range(24):
+        if not port_busy(port, h):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _quit_after_flush():
+    """把响应吐干净再退（_json 已经写完了，给 socket 一点时间）"""
+    time.sleep(0.3)
+    os._exit(0)
+
+
 def bind_server(host, want, span=20):
     """从 want 开始往后找一个能绑上的端口。返回 (server, port)，找不到给 (None, None)"""
     err = None
@@ -744,14 +926,34 @@ def main(argv=None):
     if port_busy(a.port, probe):
         url = "http://%s:%d/" % (show, a.port)
         if is_ours(a.port, probe):
-            print("\n  画布已经在 %s 跑着了，直接给你打开它。" % url)
-            if not a.no_browser:
-                webbrowser.open(url)
-            return 0
-        httpd, port = bind_server(host, a.port + 1)
-        if not httpd:
-            return 1
-        print("\n  ! 端口 %d 被别的程序占着，这次改用 %d。" % (a.port, port))
+            rv = remote_version(a.port, probe)
+            if rv == VERSION:
+                print("\n  画布已经在 %s 跑着了（v%s），直接给你打开它。" % (url, rv))
+                if not a.no_browser:
+                    webbrowser.open(url)
+                return 0
+            # 是画布，但是旧代码：它没有这一版新加的接口，复用它等于白打开一次。
+            # 所以不绕道 —— 把那个旧进程请走，原端口自己占回来，地址永远是 8277
+            print()
+            print("  ! %s 上跑着的是旧版（%s），这一版新加的接口它没有。" %
+                  (url, ("v" + rv) if rv else "比 v%s 还旧" % VERSION))
+            print("    正在把那个旧进程请走…")
+            sys.stdout.flush()
+            if take_over(a.port, probe):
+                print("    好了，%d 已空出来，新的一份接手。" % a.port)
+                httpd, port = bind_server(host, a.port)
+                if not httpd:
+                    return 1
+            else:
+                print("    它没让开（可能被别的程序守着）。这次先在 %d 起一个新的。" % (a.port + 1))
+                httpd, port = bind_server(host, a.port + 1)
+                if not httpd:
+                    return 1
+        else:
+            httpd, port = bind_server(host, a.port + 1)
+            if not httpd:
+                return 1
+            print("\n  ! 端口 %d 被别的程序占着，这次改用 %d。" % (a.port, port))
     else:
         httpd, port = bind_server(host, a.port)
         if not httpd:

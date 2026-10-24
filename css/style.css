@@ -685,7 +685,16 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
   background: #262e39; color: #8c96a4; border-radius: 4px; padding: 0 4px;
 }
 .fold-box .fold-tip { margin-left: auto; font-size: 9.5px; color: #4f5a68; }
+/* 往「更多参数」这一行上松手 = 折进去：给个明确的接收态 */
+.fold-box.drop-into { border-color: var(--accent); background: #1b2130; }
+.fold-box.drop-into > summary { color: var(--accent); }
 .fold-box > .field-flow { margin-top: 6px; }
+
+/* 拖起一个格子时，整块节点挂 .field-dragging：
+   能落的两个区描出来，放不进去的地方自然没有框 —— 不用靠试 */
+.node.field-dragging .field-flow[data-fold="0"] {
+  outline: 1px dashed #33445c; outline-offset: 3px; border-radius: 8px;
+}
 .fold-empty {
   width: 100%; padding: 14px 6px; text-align: center;
   font-size: 10px; color: #4f5a68;

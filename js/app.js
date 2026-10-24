@@ -284,12 +284,19 @@ function bindUI() {
   };
   $("#sel-close").onclick = () => view.clearSelection();
 
-  /* 拖文件到画布 → 建素材节点；从素材库拖进来 → 直接建内容节点 */
+  /* 拖文件到画布 → 建素材节点；从素材库拖进来 → 直接建内容节点
+     ⚠️ 只接「外部拖进来的文件」和「素材库条目」这两种。
+        面板里的参数格也在用 HTML5 拖拽排序，同一个 dragover 会一路冒到这里：
+        这里若无条件 preventDefault + dropEffect="copy"，就会把格子那一路设的
+        effectAllowed="move" 顶掉 —— 两者冲突时浏览器把 dropEffect 归成 none，
+        drop 事件根本不触发，表现就是「格子拖得起来、松手什么都不发生」。 */
   $("#stage").addEventListener("dragover", (e) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
   });
   $("#stage").addEventListener("drop", (e) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     const raw = e.dataTransfer?.getData("application/x-xy-lib");
     if (raw) {
@@ -492,21 +499,43 @@ async function launchComfy(force) {
   if (!btn || btn.classList.contains("busy")) return;
   btn.classList.add("busy");
   try {
-    let st = await libReq("/api/launch/state").catch(() => null);
+    /* 分清两种「没响应」：接口 404 = 后端还是旧版（serve.py 没重启）；
+       连不上 = 根本不是 serve.py 起的。说的话不一样，主人做的事也不一样 */
+    let st = null, err = "";
+    try { st = await libReq("/api/launch/state"); }
+    catch (e) { err = e.message || ""; }
     if (!st || !st.ok) {
-      throw new Error("本地服务没响应 —— 启动功能要走 serve.py（start.bat 起的那个），不是 python -m http.server");
+      throw new Error(/HTTP 404|not found/i.test(err)
+        ? "后端还是旧版 —— serve.py 得重启一次才认这个按钮（关掉那个黑窗口，重新跑 start.bat）"
+        : "本地服务没响应 —— 启动功能要走 serve.py（start.bat 起的那个），不是 python -m http.server");
+    }
+    /* 已经在跑就别再叫一个：两个 ComfyUI 抢 8188，后起的那个直接报端口占用。
+       右键（重绑）时例外 —— 那一次主人就是想换文件，不拦 */
+    if (!force) {
+      const alive = await api.systemStats().then(() => true).catch(() => false);
+      if (alive) {
+        await connect();
+        toast("ComfyUI 本来就在跑，已经连上了", "ok", 5000);
+        return;
+      }
     }
     if (force || !st.path) {
-      /* 第一次（或右键重绑）：弹系统文件框找启动文件 */
-      launchBtnText("⏻ 选启动文件…");
-      const picked = await libReq("/api/launch/pick", { method: "POST" });
-      if (!picked.path) { launchBtnText("⏻ 启动 ComfyUI"); return; }
+      /* 第一次绑：先让后端自己找 ComfyUI 的启动文件（run_*.bat 或 main.py），
+         找不到才弹系统选择框。右键 = 直接重选，不自动找 */
+      const auto = !force && st.suggest;
+      let picked = auto ? st.suggest : "";
+      if (!picked) {
+        launchBtnText("⏻ 选启动文件…");
+        const r = await libReq("/api/launch/pick", { method: "POST" });
+        if (!r.path) { launchBtnText("⏻ 启动 ComfyUI"); return; }
+        picked = r.path;
+      }
       st = await libReq("/api/launch/bind", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: picked.path }),
+        body: JSON.stringify({ path: picked }),
       });
-      toast("已绑定启动文件：" + picked.path, "ok", 6000);
+      toast((auto ? "已找到 ComfyUI 的启动文件：" : "已绑定启动文件：") + picked, "ok", 6000);
     }
     if (!st.exists) {
       toast("绑定的启动文件不在了（右键按钮重新选一个）：" + st.path, "err", 8000);
@@ -514,11 +543,7 @@ async function launchComfy(force) {
       return;
     }
     const r = await libReq("/api/launch/run", { method: "POST" });
-    if (r.kind === "launcher") {
-      toast("已打开启动器 —— 请在启动器里点「一键启动」；ComfyUI 起来后画布会自动连上", "", 10000);
-    } else {
-      toast("已启动「" + (r.path || "").split(/[\\/]/).pop() + "」，等它就绪…", "");
-    }
+    toast("已启动「" + (r.path || "").split(/[\\/]/).pop() + "」，等它就绪…", "");
     watchComfy();
   } catch (e) {
     toast(e.message, "err", 7000);
@@ -3610,6 +3635,8 @@ function attachFieldSort(wrap, node, zone, foldBox) {
     if (!cell || cell.parentElement !== wrap) return;
     dragField = { key: cell.dataset.fkey, zone, el: cell };
     cell.classList.add("dragging");
+    /* 拖起来的时候把这一区描出来：能放哪儿一眼看到，不用试 */
+    nodeEl(node)?.classList.add("field-dragging");
     e.dataTransfer.effectAllowed = "move";
     /* 拖动一开始就把折叠区展开，否则拖过去看不见落点 */
     if (foldBox) foldBox.open = true;
@@ -3621,6 +3648,8 @@ function attachFieldSort(wrap, node, zone, foldBox) {
   wrap.addEventListener("dragend", () => {
     cells().forEach(c => c.classList.remove("dragging", "drop-before", "drop-after"));
     wrap.classList.remove("drop-deny", "drop-end");
+    if (foldBox) foldBox.classList.remove("drop-into");
+    nodeEl(node)?.classList.remove("field-dragging");
     /* 折叠区里没东西就收起来，别白占一块地方 */
     if (foldBox && !foldBox.querySelector(":scope > .field-flow > .field")) foldBox.open = false;
     dragField = null;
@@ -3628,6 +3657,9 @@ function attachFieldSort(wrap, node, zone, foldBox) {
 
   wrap.addEventListener("dragover", (e) => {
     if (!dragField) return;
+    /* 内部拖拽别往上传：画布那层（#stage）会给外部文件拖拽设 dropEffect="copy"，
+       一路冒上去就会把这个 "move" 顶成 none，drop 事件随之不触发 */
+    e.stopPropagation();
     /* 跨区不接：不 preventDefault、光标给「禁止」、整片描一圈红虚线。
        光靠「放下去没反应」说明不了问题，得当场看出来这一区不收 */
     if (dragField.zone !== zone) {
@@ -3654,16 +3686,21 @@ function attachFieldSort(wrap, node, zone, foldBox) {
   });
 
   wrap.addEventListener("dragleave", (e) => {
-    if (!wrap.contains(e.relatedTarget)) {
-      clearMark();
-      wrap.classList.remove("drop-deny");
-    }
+    if (e.relatedTarget && wrap.contains(e.relatedTarget)) return;
+    /* 原生拖拽里 relatedTarget 经常是 null，光看它会让高亮一路闪；
+       真出了这一片的范围才清 */
+    const r = wrap.getBoundingClientRect();
+    if (e.clientX >= r.left && e.clientX <= r.right
+      && e.clientY >= r.top && e.clientY <= r.bottom) return;
+    clearMark();
+    wrap.classList.remove("drop-deny");
   });
 
   wrap.addEventListener("drop", (e) => {
     /* 拖的是面板里的格子，就别让画布（stage）把它当成拖素材，冒泡到此为止 */
-    if (dragField) e.stopPropagation();
-    if (!dragField || dragField.zone !== zone) { wrap.classList.remove("drop-deny"); return; }
+    if (!dragField) return;
+    e.stopPropagation();
+    if (dragField.zone !== zone) { wrap.classList.remove("drop-deny"); return; }
     e.preventDefault();
     const from = dragField.key;
     const to = cellAt(wrap, e.clientX, e.clientY);
@@ -3686,9 +3723,40 @@ function attachFieldSort(wrap, node, zone, foldBox) {
     } else {
       tgt.push(from);                                  // 落在空白 / 折叠区空提示上 → 排到这组最后
     }
+    dragField = null;                                  // renderNode 会把源元素整个换掉，dragend 可能收不到
     saveFieldOrder(node, zone, mainKeys, foldKeys);
     renderNode(node);
   });
+
+  /* 折叠区的标题条也是落点：往「更多参数」那一行上松手 = 折进去（顺带把框展开，
+     不然放完了看不见东西，人会以为丢了） */
+  if (foldBox && wrap.dataset.fold !== "1") {
+    const onBar = (e) => {
+      if (!dragField || dragField.zone !== zone) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.type === "dragover") { foldBox.classList.add("drop-into"); return; }
+      foldBox.classList.remove("drop-into");
+      const flows = zoneFlows(node, zone);
+      const keysOf = (w) => (w ? [...w.querySelectorAll(":scope > .field")].map(c => c.dataset.fkey) : []);
+      const from = dragField.key;
+      const mainKeys = keysOf(flows.main).filter(k => k !== from);
+      const foldKeys = keysOf(flows.fold).filter(k => k !== from);
+      if (from && !foldKeys.includes(from)) foldKeys.push(from);
+      foldBox.open = true;
+      dragField = null;
+      saveFieldOrder(node, zone, mainKeys, foldKeys);
+      renderNode(node);
+    };
+    const sumEl = foldBox.querySelector(":scope > summary");
+    if (sumEl) {
+      sumEl.addEventListener("dragover", onBar);
+      sumEl.addEventListener("drop", onBar);
+      sumEl.addEventListener("dragleave", (e) => {
+        if (!sumEl.contains(e.relatedTarget)) foldBox.classList.remove("drop-into");
+      });
+    }
+  }
 }
 
 
