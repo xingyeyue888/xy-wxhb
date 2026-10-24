@@ -16,7 +16,7 @@ export class CanvasView {
    * @param {Function}    o.onSelect 选中变化 (ids:Set)
    * @param {Function}    o.onChange 视图或节点位置变化（用于持久化）
    */
-  constructor({ stage, world, nodesEl, edgesEl, onSelect, onChange }) {
+  constructor({ stage, world, nodesEl, edgesEl, onSelect, onChange, onResize }) {
     this.stage = stage;
     this.world = world;
     this.nodesEl = nodesEl;          // 节点层容器
@@ -30,6 +30,8 @@ export class CanvasView {
     this.selected = new Set();
     this.onSelect = onSelect || (() => { });
     this.onChange = onChange || (() => { });
+    /* 节点尺寸变了（拖右下角 / 双击还原）—— 内容要跟着重排，光靠 onChange 分不清是拖动还是改大小 */
+    this.onResize = onResize || (() => { });
     this._drag = null;
     this._spaceDown = false;
     this._bind();
@@ -256,6 +258,7 @@ export class CanvasView {
     }
     n.el.classList.add("resized");
     this.scheduleEdges();
+    this.onResize(id);
     this.onChange();
   }
 
@@ -268,6 +271,7 @@ export class CanvasView {
     n.el.style.height = "";
     n.el.classList.remove("resized");
     this.scheduleEdges();
+    this.onResize(id);
     this.onChange();
   }
 
@@ -340,10 +344,18 @@ export class CanvasView {
        · 想在哪都能缩放：按住 Ctrl / ⌘ 滚滚轮（触控板捏合同样走这条） */
     this.stage.addEventListener("wheel", (e) => {
       const mod = e.ctrlKey || e.metaKey;
-      /* 节点里：有得滚就交给它滚（到底了它自己会停），没得滚就什么都不做 */
-      if (!mod && e.target?.closest?.(".node")) {
-        if (!this._scrollableUnder(e.target)) e.preventDefault();
-        return;
+      if (!mod) {
+        const sc = this._scrollableUnder(e.target);
+        if (sc) {
+          /* 有滑道就必须滚得动：先让浏览器原生滚（触控板的惯性、平滑滚动都留着），
+             下一帧再看一眼 —— 要是压根没动，就自己按 deltaY 滚一格。
+             以前这里只是「不拦」：浏览器一旦没接手，滚轮就彻底失效，
+             滑道明明在那儿却拖不动。 */
+          this._nudgeScroll(sc, e);
+          return;
+        }
+        /* 节点里但确实没得滚：吃掉，别顺手把画布缩放了 */
+        if (e.target?.closest?.(".node")) { e.preventDefault(); return; }
       }
       e.preventDefault();
       const f = Math.pow(1.0015, -e.deltaY);
@@ -411,15 +423,37 @@ export class CanvasView {
     for (let x = el; x && x !== this.stage; x = x.parentElement) {
       /* 走到节点外面就收手：画布本身的滚动不算数 */
       if (!x.closest?.(".node")) break;
+      if (x.nodeType !== 1) continue;
+      const tag = x.tagName;
+      /* 表单控件（提示词 textarea 就是它）：overflow 由浏览器 UA 样式给，
+         computed 有时读成 visible，光看 overflow 会把它漏掉。
+         这里直接按「内容有没有超出」判，漏判就等于整块滚轮失灵。 */
+      if (tag === "TEXTAREA" || tag === "INPUT" || x.isContentEditable) {
+        if (x.scrollHeight > x.clientHeight + 1) return x;
+        continue;
+      }
       const cs = getComputedStyle(x);
-      const oy = cs.overflowY;
-      const canScrollY = oy === "auto" || oy === "scroll" || oy === "overlay";
-      const canScrollX = cs.overflowX === "auto" || cs.overflowX === "scroll";
-      const over = canScrollY && x.scrollHeight > x.clientHeight + 1
-        || canScrollX && x.scrollWidth > x.clientWidth + 1;
+      const canY = cs.overflowY === "auto" || cs.overflowY === "scroll" || cs.overflowY === "overlay";
+      const canX = cs.overflowX === "auto" || cs.overflowX === "scroll";
+      const over = (canY && x.scrollHeight > x.clientHeight + 1)
+        || (canX && x.scrollWidth > x.clientWidth + 1);
       if (over) return x;
     }
     return null;
+  }
+
+  /** 原生滚完兜底：这一帧里它没滚动，就自己滚一格（滚到边界自动停，不会外溢到画布） */
+  _nudgeScroll(sc, e) {
+    const before = sc.scrollTop;
+    requestAnimationFrame(() => {
+      try {
+        if (sc.scrollTop !== before) return;          // 浏览器已经滚过了
+        const max = sc.scrollHeight - sc.clientHeight;
+        if (max <= 0) return;                         // 真的没得滚
+        const unit = e.deltaMode === 1 ? 18 : e.deltaMode === 2 ? sc.clientHeight : 1;
+        sc.scrollTop = Math.max(0, Math.min(max, before + e.deltaY * unit));
+      } catch { /* 元素已被重渲染掉，忽略 */ }
+    });
   }
 
   /** 框选：按住空格 + 左键拉一个矩形，碰到的节点全选中 */

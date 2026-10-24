@@ -90,6 +90,8 @@ function init() {
       S.view = view.view;
       scheduleSave();
     },
+    /* 拖右下角改大小 → 让提示词框跟着长（拖的每一帧都来一次，所以只看尺寸不算别的） */
+    onResize: (id) => fitTextBoxes(S.nodes.find(n => n.id === id)),
   });
 
   view.setEdges(S.edges);
@@ -889,6 +891,108 @@ function setUiWidget(nd, cls, field, value) {
   return hit;
 }
 
+/* ==================================================================
+   这一格在文件里是「接线」，而不是「节点自带的那个值」
+   ──────────────────────────────────────────────────────────────────
+   h3 长视频的时长就是这样：消费它的节点（ComfyMathExpression）里，
+   inputs["values.a"] 指到一个 PrimitiveFloat（标题就是 Float (duration)），
+   节点自己的 widgets_values 里根本没有这一格。
+   以前 setUiWidget 按 widget 顺序找不到位置就返回 false，调用方直接 continue ——
+   于是画布上把时长从 10.1 改成 15，文件里纹丝不动，还一句错都不报。
+   现在顺着那条线摸到真正的常量节点，把值写进它自己的 widgets_values。
+================================================================== */
+const PRIM_VALUE_NODE = /^Primitive(Node|Int|Float|String|Boolean|BoundingBox|Text)$/;
+
+/** UI 工作流里的 links 表统一成 Map（老格式是数组，新格式是对象） */
+function linkMapOf(wf) {
+  const m = new Map();
+  for (const l of (wf?.links || [])) {
+    if (Array.isArray(l)) {
+      m.set(String(l[0]), { src: String(l[1]), srcSlot: l[2], dst: String(l[3]), dstSlot: l[4], type: l[5] });
+    } else if (l && l.id != null) {
+      const src = l.origin_id ?? l.source ?? l.source_id;
+      const dst = l.target_id ?? l.target ?? l.target_id;
+      m.set(String(l.id), {
+        src: String(src), srcSlot: l.origin_slot ?? l.source_slot,
+        dst: String(dst), dstSlot: l.target_slot, type: l.type,
+      });
+    }
+  }
+  return m;
+}
+
+/** 顺着「这一格是接线」摸到真正存值的常量节点；不是接线 / 途中经过算子就返回 null */
+function constSlotOf(wf, nid, field) {
+  const nodes = wf?.nodes || [];
+  const nd = nodes.find(n => String(n.id) === String(nid));
+  if (!nd) return null;
+  const inp = (nd.inputs || []).find(i => i.name === field);
+  if (!inp || inp.link == null) return null;
+  const links = linkMapOf(wf);
+  let lk = links.get(String(inp.link));
+  for (let g = 0; lk && g < 32; g++) {
+    const sn = nodes.find(n => String(n.id) === String(lk.src));
+    if (!sn) return null;
+    if (PRIM_VALUE_NODE.test(String(sn.type))) {
+      const named = (sn.widgets_values_named && typeof sn.widgets_values_named === "object") ? sn.widgets_values_named : null;
+      return { node: sn, named };
+    }
+    if (sn.type === "Reroute") {           /* 透传节点：接着往上摸 */
+      const l2 = (sn.inputs || [])[0]?.link;
+      lk = l2 != null ? links.get(String(l2)) : null;
+      continue;
+    }
+    return null;                            /* 经过表达式 / 采样节点：那里没有「一个数」可写 */
+  }
+  return null;
+}
+
+/** 读这个常量节点现在存的值 */
+function readConstSlot(cs) {
+  if (!cs) return undefined;
+  if (cs.named && "value" in cs.named) return cs.named.value;
+  const arr = Array.isArray(cs.node.widgets_values) ? cs.node.widgets_values : null;
+  if (arr) return arr.length ? arr[0] : undefined;
+  return cs.node.widgets_values === undefined ? undefined : cs.node.widgets_values;
+}
+
+/** 把值写进这个常量节点（named / 数组两种存法都改；类型不符宁可不写） */
+function writeConstSlot(cs, value) {
+  if (!cs) return false;
+  let hit = false;
+  if (cs.named && "value" in cs.named && typeFits(cs.named.value, value)) {
+    cs.named.value = value; hit = true;
+  }
+  if (Array.isArray(cs.node.widgets_values)) {
+    const arr = cs.node.widgets_values;
+    if (!arr.length) { arr[0] = value; hit = true; }
+    else if (typeFits(arr[0], value)) { arr[0] = value; hit = true; }
+  } else {
+    cs.node.widgets_values = [value]; hit = true;
+  }
+  return hit;
+}
+
+/** 这一格现在实际是什么值：接线驱动的先看源头常量，其次才看节点自带的值 */
+function readFieldValue(wf, nid, field) {
+  const cs = constSlotOf(wf, nid, field);
+  if (cs) {
+    const cv = readConstSlot(cs);
+    if (cv !== undefined) return cv;
+  }
+  const nd = (wf?.nodes || []).find(n => String(n.id) === String(nid));
+  return nd ? readUiWidget(nd, nd.type, field) : undefined;
+}
+
+/** 写这一格：接线驱动的写源头那个常量，自带的值写节点自己 */
+function writeFieldValue(wf, nid, field, value) {
+  const nd = (wf?.nodes || []).find(n => String(n.id) === String(nid));
+  if (!nd) return false;
+  const cs = constSlotOf(wf, nid, field);
+  if (cs && writeConstSlot(cs, value)) return true;
+  return setUiWidget(nd, nd.type, field, value);
+}
+
 /** 同一个节点连着改好几格，提示别刷屏 */
 const pushToastAt = new Map();
 function pushToast(node, text, kind) {
@@ -976,6 +1080,12 @@ async function flushParamPush(node) {
   node._pushing = true;
   try {
     return await flushParamPushInner(node, items);
+  } catch (e) {
+    /* 以前这里一路 catch(()=>{})，出错等于没发生：用户改了参数、文件没动、屏幕上也没一句话。
+       写不进去必须说出来。 */
+    pushToast(node, `写回 ComfyUI 出错：${e.message || e}`, "err");
+    console.error("flushParamPush", e);
+    return { error: 1 };
   } finally {
     node._pushing = false;
     if (node._pushAgain) {
@@ -989,8 +1099,13 @@ async function flushParamPushInner(node, items) {
   /* 写到磁盘之后，画布内存也跟上，别让两边各执一份 */
   const applyMemory = () => {
     for (const it of items) {
-      const ui = (node.uiWf.nodes || []).find(n => String(n.id) === it.nid);
-      if (ui) setUiWidget(ui, ui.type, it.field, it.value);
+      writeFieldValue(node.uiWf, it.nid, it.field, it.value);
+      /* 跑的时候用的是 node.prompt（内联过的），不是 uiWf。
+         只改 uiWf 的话，文件里已经是新时长，刚从画布跑一遍却还是旧帧数 */
+      const pn = node.prompt?.[it.nid];
+      if (pn && pn.inputs && Object.prototype.hasOwnProperty.call(pn.inputs, it.field)) {
+        pn.inputs[it.field] = it.value;
+      }
     }
   };
 
@@ -1002,9 +1117,9 @@ async function flushParamPushInner(node, items) {
   for (const it of items) {
     const nd = (disk.nodes || []).find(n => String(n.id) === it.nid);
     if (!nd) continue;                                                      // 画布补出来的节点，文件里没有
-    const cur = readUiWidget(nd, nd.type, it.field);
+    const cur = readFieldValue(disk, it.nid, it.field);
     if (sameVal(cur, it.value) || sameVal(normWidget(nd.type, it.field, cur), it.value)) continue;  // 文件里已经是这个值
-    if (!setUiWidget(nd, nd.type, it.field, it.value)) continue;             // 这一格没存在文件里
+    if (!writeFieldValue(disk, it.nid, it.field, it.value)) continue;       // 这一格没存在文件里（也不是接线常量）
     /* 导演台的分段模式：时间线 JSON 里的 taskType 优先级更高，只改 widget 等于没改 */
     if (RE_MODE.test(it.field) && DIRECTOR_CLS.test(String(nd.type || ""))) {
       const tl = readUiWidget(nd, nd.type, "timeline_data");
@@ -1021,7 +1136,7 @@ async function flushParamPushInner(node, items) {
     const miss = applied.filter(it => {
       const nd = (wf.nodes || []).find(n => String(n.id) === it.nid);
       if (!nd) return true;
-      const got = readUiWidget(nd, nd.type, it.field);
+      const got = readFieldValue(wf, it.nid, it.field);
       return !(sameVal(got, it.value) || sameVal(normWidget(nd.type, it.field, got), it.value));
     }).map(it => it.field);
     return { ok: !miss.length, miss };
@@ -1046,7 +1161,7 @@ async function flushParamPushInner(node, items) {
         + " —— ComfyUI 那边是不是正开着这份工作流？关掉那一页再改一次", "err");
       return { error: 1, miss: r.miss };
     }
-    const names = applied.map(a => a.field);
+    const names = applied.map(a => node._cn?.[a.nid + "|" + a.field] || a.field);
     pushToast(node, names.length === 1
       ? `已写回 ComfyUI：「${names[0]}」`
       : `已写回 ComfyUI：${names.slice(0, 3).join("、")}${names.length > 3 ? ` 等 ${names.length} 项` : ""}`, "ok");
@@ -1233,6 +1348,8 @@ function buildFields(node) {
         title: t, cls: nd.class_type,
         locked: locks[k] || "",
         fromPrim: !!inlined[k],
+        /* 内联常量没有标题可认名字了，就从算式反推它是什么单位 */
+        sem: inlined[k] ? operandSem(node.prompt, nodeId, k) : "",
       });
     }
   }
@@ -1267,6 +1384,8 @@ const TITLE_SEM = [
 ];
 /** 参数在这个面板上「叫什么」：泛名 widget 用节点标题里的词顶上，其余用原名 */
 function semName(f) {
+  /* 已经从算式里推出来的语义最准（a * 24 → 秒），压过标题与原名 */
+  if (f?.sem) return f.sem;
   const n = String(f?.name ?? "");
   /* 单字母（ComfyMathExpression 的 a / b）和内联常量也靠标题认：
      它们的名字本来就没有含义，含义只写在原节点标题里 */
@@ -1274,6 +1393,56 @@ function semName(f) {
   const t = String(f?.title || "");
   for (const [re, name] of TITLE_SEM) if (re.test(t)) return name;
   return n;
+}
+
+/* ==================================================================
+   数学表达式里的操作数到底代表什么
+   ──────────────────────────────────────────────────────────────────
+   换成官方 PrimitiveFloat 之后，那个常量节点没有标题了（以前第三方节点
+   自带「Float (duration)」），标题这条路彻底断掉，面板上只剩一个 values.a。
+
+   但算式本身把单位写在里头：
+       length = max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17
+   `a * 24` 里的 24 正好是工作流里 CreateVideo 的 fps，而这一路输出接的是
+   frames 类的输入（length / num_frames）—— 两条一对上，a 的单位就是「秒」。
+
+   只在两条证据同时成立时才下结论；认不出返回空串，宁可叫 values.a，
+   也不凭空编一个名字出来。
+================================================================== */
+const RE_FRAMES_IN = /^(length|num_frames|total_frames|frame_count|frames|video_length)$/i;
+
+function operandSem(prompt, nid, field) {
+  const m = /^values\.([a-z])$/i.exec(String(field || ""));
+  if (!m) return "";
+  const letter = m[1].toLowerCase();
+  const nd = prompt?.[String(nid)];
+  const expr = String(nd?.inputs?.expression ?? "");
+  if (!expr) return "";
+
+  /* ① 这个字母乘过一个常数（a * 24 / round(a*24) / a * 24.0 都算） */
+  let scale = 0;
+  const re = new RegExp("(?:^|[^a-z0-9_])" + letter + "\\s*\\*\\s*(\\d+(?:\\.\\d+)?)", "gi");
+  let hit;
+  while ((hit = re.exec(expr))) scale = Number(hit[1]);
+  if (!scale) return "";
+
+  /* ② 这个数学节点的某一路输出，接在了「帧数」类的输入上 */
+  let feedsFrames = false;
+  for (const [pid, pn] of Object.entries(prompt || {})) {
+    if (String(pid) === String(nid)) continue;
+    for (const [k, v] of Object.entries(pn?.inputs || {})) {
+      if (!Array.isArray(v) || String(v[0]) !== String(nid)) continue;
+      if (RE_FRAMES_IN.test(k)) { feedsFrames = true; break; }
+    }
+    if (feedsFrames) break;
+  }
+  if (!feedsFrames) return "";
+
+  /* ③ 乘数就是工作流里的帧率 → 这一格是秒 */
+  for (const pn of Object.values(prompt || {})) {
+    if (typeof pn?.inputs?.fps === "number" && pn.inputs.fps === scale) return "duration";
+  }
+  return "";
 }
 
 /* ==================================================================
@@ -1808,6 +1977,9 @@ function fieldControl(f, node, opt) {
      「二采音频强度」，配着角标就成了「二采 二采音频强度」） */
   const pcn = PASS_CN[f._pass] || "";
   const cnBody = pcn && cn.startsWith(pcn) ? cn.slice(pcn.length).trim() || cn : cn;
+  /* 记一笔「这一格叫什么中文」：写回成功的提示要用它，
+     不然 toast 里蹦出来的是 values.a 这种内部字段名 */
+  if (node) (node._cn || (node._cn = {}))[f.key] = cnBody;
   const tag = f._pass ? `<em class="pass-mini">${pcn}</em>` : "";
   /* 右边要挂节点角标时就不摆英文原名了 —— 一行里塞三个东西谁也看不清，
      何况角标里本来就是节点的英文类名 */
@@ -2594,6 +2766,8 @@ function makeContentNode(kind, got, x, y, name) {
     id: uid(), kind: "content", inKind: kind,
     name: name || `结果 · ${WANT_CN[kind]}`,
     x, y, params: {}, value: "", sub: "", sType: "", src: "",
+    /* 图像 / 视频结果节点默认给宽一些：默认 360px 的框型装不下 640px 的预览 */
+    w: (kind === "image" || kind === "video") ? 520 : undefined,
     status: "done", error: "", result: null,
   };
   applyResult(node, kind, got);
@@ -2743,6 +2917,54 @@ function mountNode(node) {
 
 function nodeEl(node) { return view.nodes.get(node.id)?.el; }
 
+/* ==================================================================
+   提示词框跟着节点框一起长
+   ──────────────────────────────────────────────────────────────────
+   以前工作流节点里的提示词框按 rows（3~6 行）定死：把节点从 400px 拉到 760px，
+   底下只是多一片空白，想多看几行还得再拖一次输入框自己的右下角 —— 一根节点
+   要调两次尺寸。
+
+   规则：
+     · 只认「手动拉过尺寸」的节点（.resized）；自适应高度的节点保持原样，
+       免得一加参数就把框撑大；
+     · 正文可视高度的一半分给这些框，按个平均；内容本来就没几行的框不上撑
+       （按各自 scrollHeight 封顶），不会出现半屏空白。
+   这里刻意用算出来的 px 而不是 flex：工作流节点的正文里套着 sec / sec-body
+   好几层，逐层改成 flex 会牵连素材槽、网格两列这些布局。
+================================================================== */
+function fitTextBoxes(node) {
+  const el = nodeEl(node);
+  if (!el || !el.classList.contains("resized")) return;
+  const body = el.querySelector(".node-body");
+  if (!body) return;
+  const tas = [...body.querySelectorAll("textarea")].filter(t => t.offsetParent !== null);
+  if (!tas.length) return;
+  for (const t of tas) t.style.height = "";                    // 先还原，量自然高度
+
+  /* 每块框「还能长多高」= 内容高度 - 自然高度；内容只有两行的框几乎不占额度，
+     省下来的高度要还给提示词框（平分的话，两行高的那个框会白白吃掉一半） */
+  const boxes = tas.map(t => ({
+    t, natural: t.offsetHeight,
+    room: Math.max(0, (t.scrollHeight || 0) + 2 - t.offsetHeight),
+    add: 0,
+  }));
+  let left = Math.round(body.clientHeight * 0.5);
+  let pool = boxes.filter(b => b.room > 0);
+  while (left > 0 && pool.length) {
+    const share = Math.max(1, Math.floor(left / pool.length));
+    let given = 0;
+    for (const b of pool) {
+      const give = Math.min(share, b.room - b.add, left - given);
+      if (give <= 0) continue;
+      b.add += give; given += give;
+    }
+    left -= given;
+    if (!given) break;                                          // 没有进展就收手，别空转
+    pool = pool.filter(b => b.add < b.room);
+  }
+  for (const b of boxes) if (b.add > 0) b.t.style.height = (b.natural + b.add) + "px";
+}
+
 /* ---------------- 素材节点的内容 ---------------- */
 /** 素材节点接住了上游产出：优先显示产出，本地文件另存着不丢 */
 function pulledUrl(node) {
@@ -2818,10 +3040,12 @@ function renderInputBody(node, el) {
       img.src = url; img.title = "点开看大图";
       img.onclick = () => window.open(url, "_blank");
       pv.appendChild(img);
+      attachResBadge(pv, img);
     } else if (node.inKind === "video") {
       const v = document.createElement("video");
       v.src = url; v.controls = true; v.loop = true;
       pv.appendChild(v);
+      attachResBadge(pv, v);
     } else {
       const a = document.createElement("audio");
       a.src = url; a.controls = true;
@@ -2863,10 +3087,12 @@ function renderInputBody(node, el) {
       img.src = src; img.title = "点开看大图";
       img.onclick = () => window.open(src, "_blank");
       pv.appendChild(img);
+      attachResBadge(pv, img);
     } else if (node.inKind === "video") {
       const v = document.createElement("video");
       v.src = src; v.controls = true; v.loop = true; v.muted = true;
       pv.appendChild(v);
+      attachResBadge(pv, v);
     } else {
       const a = document.createElement("audio");
       a.src = src; a.controls = true;
@@ -3273,6 +3499,8 @@ function renderNode(node) {
   if (out) { out.innerHTML = ""; out.classList.add("hide"); }
 
   if (keepScroll && scrollBody) scrollBody.scrollTop = keepScroll;
+  /* 重画会把提示词框打回 rows 高度 —— 拉过尺寸的节点得重新把高度分一次 */
+  fitTextBoxes(node);
 
   paintStatus(node);
   view.scheduleEdges();
@@ -3842,6 +4070,36 @@ function pickAssetFile(node, f, tt) {
   inp.click();
 }
 
+/* ---------------- 分辨率角标 ---------------- */
+/**
+ * 在预览框右上角标出真实像素尺寸。
+ * 图片读 naturalWidth/Height，视频读 videoWidth/Height（要等元数据到）；
+ * 读不到就什么都不显示 —— 宁可空着，也不猜一个数字糊上去。
+ */
+function attachResBadge(pv, media) {
+  if (!pv || !media) return;
+  const show = (w, h) => {
+    if (!w || !h) return;
+    let b = pv.querySelector(".res-badge");
+    if (!b) {
+      b = document.createElement("div");
+      b.className = "res-badge";
+      pv.appendChild(b);
+    }
+    b.textContent = `${w} × ${h}`;
+    b.title = `分辨率 ${w} × ${h}`;
+  };
+  if (media.tagName === "IMG") {
+    if (media.naturalWidth) show(media.naturalWidth, media.naturalHeight);
+    else media.addEventListener("load",
+      () => show(media.naturalWidth, media.naturalHeight), { once: true });
+  } else if (media.tagName === "VIDEO") {
+    const go = () => show(media.videoWidth, media.videoHeight);
+    if (media.videoWidth) go();
+    else media.addEventListener("loadedmetadata", go, { once: true });
+  }
+}
+
 /* ---------------- 输出内容节点 ---------------- */
 function renderContentBody(node, el) {
   const body = el.querySelector(".node-body");
@@ -3879,10 +4137,12 @@ function renderContentBody(node, el) {
     img.title = "点开看大图";
     img.onclick = () => window.open(url, "_blank");
     pv.appendChild(img);
+    attachResBadge(pv, img);
   } else if (node.inKind === "video") {
     const v = document.createElement("video");
     v.src = url; v.controls = true; v.loop = true;
     pv.appendChild(v);
+    attachResBadge(pv, v);
   } else {
     const a = document.createElement("audio");
     a.src = url; a.controls = true;

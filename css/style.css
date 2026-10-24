@@ -890,10 +890,31 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 .in-drop b { display: block; font-size: 18px; font-weight: 400; opacity: .55; margin-bottom: 2px; }
 
 .in-preview {
+  position: relative;                 /* 右上角的分辨率角标靠它定位 */
   border-radius: 8px; overflow: hidden; background: #0d0f12;
   display: grid; place-items: center; min-height: 40px;
 }
-.in-preview img, .in-preview video { width: 100%; display: block; max-height: 260px; object-fit: contain; }
+/* 图像 / 视频的框型放大：原来死死压在 260px，横图竖图都看不出细节 */
+.in-preview img, .in-preview video {
+  width: 100%; display: block; max-height: 640px; object-fit: contain;
+}
+.in-preview img { cursor: zoom-in; }
+
+/* 分辨率角标：放右上角，避开视频底部那排控件；半透明、不抢画面 */
+.res-badge {
+  position: absolute; top: 8px; right: 8px;
+  padding: 2px 6px; border-radius: 5px;
+  background: rgba(10, 12, 16, .72);
+  border: 1px solid rgba(255, 255, 255, .1);
+  color: #dbe3ee; font: 10px/1.5 ui-monospace, Consolas, monospace;
+  letter-spacing: .3px; pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+body.day .res-badge {
+  background: rgba(255, 255, 255, .82);
+  border-color: rgba(20, 30, 45, .12);
+  color: #2a3341;
+}
 .in-preview audio { width: 100%; display: block; padding: 8px 6px; }
 .in-preview .ph { padding: 18px; color: var(--txt-3); font-size: 11px; }
 
@@ -913,7 +934,10 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 .pulled-text .out-text { max-height: 130px; }
 
 .in-text {
-  width: 100%; min-height: 110px; resize: vertical;
+  width: 100%; min-height: 110px; resize: none;
+  /* 跟着节点框长：节点被拉高，输入框自己撑满剩下的高度，
+     不用再手动拖右下角那个把手（以前两处都能改高度，等于要调两次） */
+  flex: 1 1 auto; align-self: stretch;
   background: #1b1f26; border: 1px solid var(--line); color: var(--txt);
   border-radius: 6px; padding: 6px 7px; font-size: 12px;
   font-family: inherit; line-height: 1.5; outline: none;
