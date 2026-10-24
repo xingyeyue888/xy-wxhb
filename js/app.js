@@ -4085,7 +4085,8 @@ function orderLorasByChain(node, ids, stg) {
 
 /* LoRA 卡的小型化：叠加链的顺序不能动（改了就换出图结果），但占的地方可以省。
    缩成一条 50 宽的窄条，只留一颗「复原」；多张能并排，顺序一个字没变。
-   高度记的是缩之前量到的那一个，展开回来还是一模一样。 */
+   高度记下缩之前量到的那一个，好让同组窄条取一个统一高度 ——
+   各张卡本身的高矮不一样（有的两行强度、有的多一行说明），各用各的会参差不齐。 */
 function loraMiniState(node) {
   const rec = S.orders?.[orderKeyOf(node)] || {};
   return {
@@ -4106,17 +4107,27 @@ function setLoraMini(node, id, on, h) {
     if (h) o.loraMiniH[String(id)] = Math.round(h);
   } else {
     set.delete(String(id));
+    delete o.loraMiniH[String(id)];      // 复原了就忘掉它的高度，别留着拉低下一轮的统一值
   }
   o.loraMini = [...set];
   save();
   renderNode(node);
 }
 
-/** 缩小之后的样子：50 宽、高度还是缩之前那个高度，身上只有一颗「复原」 */
-function loraMiniCard(node, info, h) {
+/** 窄条的统一高度：只看当前缩着的那些，取最矮的那一个 ——
+    并排在一起齐整，又不会比任何一张缩之前更高（不会把节点撑大）。
+    没有记录（老存档）就给个够放「复原」两字的兜底值。 */
+function miniHeightOf(node) {
+  const st = loraMiniState(node);
+  const vals = st.list.map(id => Number(st.h[id])).filter(v => v > 0);
+  return Math.max(56, vals.length ? Math.min(...vals) : 96);
+}
+
+/** 缩小之后的样子：50 宽、高度与同组窄条一致，身上只有一颗「复原」 */
+function loraMiniCard(node, info) {
   const card = document.createElement("div");
   card.className = "lora-card mini";
-  if (h) card.style.height = h + "px";
+  card.style.height = miniHeightOf(node) + "px";
   const b = document.createElement("button");
   b.className = "lora-back";
   b.innerHTML = "<span>复</span><span>原</span>";
@@ -4133,7 +4144,7 @@ function loraCard(node, fs, idx, pass) {
   /* 缩过的卡：直接出窄条，里面的输入框一概不画（改不了也不该占地方） */
   const ms = loraMiniState(node);
   if (ms.list.includes(String(id))) {
-    return loraMiniCard(node, { id, label: `LoRA ${idx} · ${nd.class_type || ""}` }, ms.h[String(id)]);
+    return loraMiniCard(node, { id, label: `LoRA ${idx} · ${nd.class_type || ""}` });
   }
   const card = document.createElement("div");
   card.className = "lora-card" + (off ? " off" : "");
@@ -4244,7 +4255,7 @@ function loraDormantCard(node, info) {
   /* 停用的 LoRA 也是 LoRA，一样能缩小 */
   const ms = loraMiniState(node);
   if (info.id !== undefined && info.id !== null && ms.list.includes(String(info.id))) {
-    return loraMiniCard(node, { id: info.id, label: `${info.idx} · ${info.cls}` }, ms.h[String(info.id)]);
+    return loraMiniCard(node, { id: info.id, label: `${info.idx} · ${info.cls}` });
   }
   const card = document.createElement("div");
   card.className = "lora-card off";
