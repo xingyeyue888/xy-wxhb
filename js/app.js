@@ -202,6 +202,10 @@ function bindUI() {
   };
   $("#comfy-url").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-connect").click(); });
 
+  /* 启动 ComfyUI：左键启动，右键重新挑启动文件 */
+  $("#btn-launch").onclick = () => launchComfy(false);
+  $("#btn-launch").oncontextmenu = (e) => { e.preventDefault(); launchComfy(true); };
+
   $("#btn-fit").onclick = () => view.fitToContent();
   $("#btn-day").onclick = () => applyDay(!document.body.classList.contains("day"));
   $("#btn-bgimg").onclick = () => {
@@ -461,6 +465,96 @@ function setConn(cls, text) {
   const el = $("#conn-state");
   el.className = "conn " + cls;
   el.textContent = text;
+}
+
+/* ==================================================================
+   启动 ComfyUI
+   ──────────────────────────────────────────────────────────────────
+   浏览器没有「运行本机程序」的权限，所以这件事只能交给本地服务来做：
+   画布点一下 → serve.py 起进程 → 画布自己盯着 8188，起来了就自动连上。
+
+   第一次点会弹系统文件框，让你指认启动文件；选过一次就记住了
+   （记在 ~/.xy-wxhb-launcher.json，不跟 localStorage 走，换份画布也不用重绑）。
+   绑的可以是 ComfyUI 自己的 run_nvidia_gpu.bat，也可以是秋叶绘世这类第三方
+   启动器 —— 后者点开只是把启动器叫出来，ComfyUI 还得在启动器里再点一下，
+   所以提示语分开说，别让人以为按下去没反应。
+   想换一个启动文件：右键按钮。
+================================================================== */
+let comfyWatch = null;
+
+function launchBtnText(t) {
+  const b = $("#btn-launch");
+  if (b) b.textContent = t;
+}
+
+async function launchComfy(force) {
+  const btn = $("#btn-launch");
+  if (!btn || btn.classList.contains("busy")) return;
+  btn.classList.add("busy");
+  try {
+    let st = await libReq("/api/launch/state").catch(() => null);
+    if (!st || !st.ok) {
+      throw new Error("本地服务没响应 —— 启动功能要走 serve.py（start.bat 起的那个），不是 python -m http.server");
+    }
+    if (force || !st.path) {
+      /* 第一次（或右键重绑）：弹系统文件框找启动文件 */
+      launchBtnText("⏻ 选启动文件…");
+      const picked = await libReq("/api/launch/pick", { method: "POST" });
+      if (!picked.path) { launchBtnText("⏻ 启动 ComfyUI"); return; }
+      st = await libReq("/api/launch/bind", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: picked.path }),
+      });
+      toast("已绑定启动文件：" + picked.path, "ok", 6000);
+    }
+    if (!st.exists) {
+      toast("绑定的启动文件不在了（右键按钮重新选一个）：" + st.path, "err", 8000);
+      launchBtnText("⏻ 启动 ComfyUI");
+      return;
+    }
+    const r = await libReq("/api/launch/run", { method: "POST" });
+    if (r.kind === "launcher") {
+      toast("已打开启动器 —— 请在启动器里点「一键启动」；ComfyUI 起来后画布会自动连上", "", 10000);
+    } else {
+      toast("已启动「" + (r.path || "").split(/[\\/]/).pop() + "」，等它就绪…", "");
+    }
+    watchComfy();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+    launchBtnText("⏻ 启动 ComfyUI");
+  } finally {
+    btn.classList.remove("busy");
+  }
+}
+
+/** 启动之后盯着 8188：起来了就自动连上，不用再点「连接」 */
+function watchComfy(maxSec = 150) {
+  if (comfyWatch) clearInterval(comfyWatch);
+  const t0 = Date.now();
+  const btn = $("#btn-launch");
+  btn?.classList.add("waiting");
+  launchBtnText("⏻ 等 ComfyUI 起来…");
+  const stop = (msg, bad) => {
+    clearInterval(comfyWatch);
+    comfyWatch = null;
+    btn?.classList.remove("waiting");
+    launchBtnText("⏻ 启动 ComfyUI");
+    if (msg) toast(msg, bad ? "err" : "ok", 8000);
+  };
+  comfyWatch = setInterval(async () => {
+    if (Date.now() - t0 > maxSec * 1000) {
+      stop("等了 " + Math.round(maxSec / 60) + " 分钟还没连上 —— 看看启动器或那个黑窗口里有没有报错", true);
+      return;
+    }
+    try {
+      await api.systemStats();
+    } catch {
+      return;                                     // 还没起来，继续等
+    }
+    if ($("#conn-state").classList.contains("on")) stop("ComfyUI 本来就在跑，已经连着", false);
+    else { stop("", false); connect(); }
+  }, 2000);
 }
 
 async function loadObjectInfo() {
@@ -3369,22 +3463,33 @@ function orderKeyOf(node) {
   return String(node?.file || node?.name || "");
 }
 
-/** 按记下的顺序重排；没记过就是原顺序，新字段追加在尾部 */
-function orderedFields(node, zone, seq) {
-  const saved = S.orders?.[orderKeyOf(node)]?.[zone];
-  if (!Array.isArray(saved) || !saved.length) return seq;
-  const pos = new Map(saved.map((k, i) => [k, i]));
-  return seq
-    .map((f, i) => ({ f, i, p: pos.has(f.key) ? pos.get(f.key) : 1e6 + i }))
-    .sort((a, b) => a.p - b.p || a.i - b.i)
-    .map((x) => x.f);
+/* 「更多参数」折叠区：不在主区里的那些格子，顺序单独记一份（zone + "Fold"）。
+   两个列表就是全部事实：在哪个列表里，就在哪一块里；顺序就是列表顺序。
+   工作流改版新加的参数两边都没有 → 按默认顺序追加到主区末尾。 */
+function splitFields(node, zone, seq) {
+  const rec = S.orders?.[orderKeyOf(node)] || {};
+  const mainSaved = Array.isArray(rec[zone]) ? rec[zone] : null;
+  const foldSaved = Array.isArray(rec[zone + "Fold"]) ? rec[zone + "Fold"] : null;
+  if (!mainSaved && !foldSaved) return { main: seq, fold: [] };
+  const byKey = new Map(seq.map(f => [f.key, f]));
+  const take = (list) => (list || []).map(k => byKey.get(k)).filter(Boolean);
+  let main = take(mainSaved);
+  const fold = take(foldSaved);
+  const seen = new Set([...(mainSaved || []), ...(foldSaved || [])]);
+  main = main.concat(seq.filter(f => !seen.has(f.key)));
+  /* 同一个 key 两个列表里都有（记录被写乱过）→ 以折叠为准，别摆两份 */
+  const fk = new Set(fold.map(f => f.key));
+  main = main.filter(f => !fk.has(f.key));
+  return { main, fold };
 }
 
-function saveFieldOrder(node, zone, keys) {
+function saveFieldOrder(node, zone, mainKeys, foldKeys) {
   const k = orderKeyOf(node);
   if (!k) return;
   S.orders = S.orders || {};
-  (S.orders[k] || (S.orders[k] = {}))[zone] = keys;
+  const o = S.orders[k] || (S.orders[k] = {});
+  o[zone] = mainKeys;
+  o[zone + "Fold"] = foldKeys;
   save();
 }
 
@@ -3418,20 +3523,70 @@ function tagMaker(node, fields) {
 /* 正在拖的那一格：只在一次拖拽期间有效 */
 let dragField = null;
 
-/** 区内容器：一堆固定尺寸的格子，可拖着换位置 */
+/** 一个格子：固定 200×50，多行文本单独放宽 */
+function fieldCell(node, f, tagOf) {
+  const cell = fieldControl(f, node, tagOf ? tagOf(f) : null);
+  cell.classList.add("cell");
+  if (isWideField(f)) cell.classList.add("cell-wide");
+  cell.dataset.fkey = f.key;
+  return cell;
+}
+
+/** 同区的两个容器（主区 / 折叠区）：拖拽时要知道对面那份的顺序 */
+function zoneFlows(node, zone) {
+  const el = nodeEl(node);
+  if (!el) return { main: null, fold: null };
+  const list = [...el.querySelectorAll(`.field-flow[data-zone="${zone}"]`)];
+  return {
+    main: list.find(w => w.dataset.fold !== "1") || null,
+    fold: list.find(w => w.dataset.fold === "1") || null,
+  };
+}
+
+/* 区内容器 = 主区一片 + 「更多参数」折叠区。
+   主区平铺全部格子；不常用又舍不得删的，拖进折叠区就收起来（还能拖回来）。
+   顺序和归属都记在 S.orders 里：zone 存主区顺序，zone+"Fold" 存折叠区顺序
+   —— 在哪个表里就在哪一块，表里的位置就是那里的位置。 */
 function fieldFlow(node, fields, zone, tagOf) {
+  const { main, fold } = splitFields(node, zone, fields);
+
   const wrap = document.createElement("div");
   wrap.className = "field-flow";
   wrap.dataset.zone = zone;
-  for (const f of orderedFields(node, zone, fields)) {
-    const cell = fieldControl(f, node, tagOf ? tagOf(f) : null);
-    cell.classList.add("cell");
-    if (isWideField(f)) cell.classList.add("cell-wide");
-    cell.dataset.fkey = f.key;
-    wrap.appendChild(cell);
+  wrap.dataset.fold = "0";
+  for (const f of main) wrap.appendChild(fieldCell(node, f, tagOf));
+
+  const box = document.createElement("details");
+  box.className = "fold-box";
+  box.dataset.zone = zone;
+  const sum = document.createElement("summary");
+  sum.innerHTML = `<span class="fold-t">更多参数</span>`
+    + `<span class="fold-n">${fold.length}</span>`
+    + `<span class="fold-tip">不常用的拖进来</span>`;
+  box.appendChild(sum);
+
+  const fw = document.createElement("div");
+  fw.className = "field-flow";
+  fw.dataset.zone = zone;
+  fw.dataset.fold = "1";
+  for (const f of fold) fw.appendChild(fieldCell(node, f, tagOf));
+  if (!fold.length) {
+    const empty = document.createElement("div");
+    empty.className = "fold-empty";
+    empty.textContent = "空的 —— 拖一个格子进来，就折叠在这儿";
+    fw.appendChild(empty);
   }
-  attachFieldSort(wrap, node, zone);
-  return wrap;
+  box.appendChild(fw);
+  /* 已经折了东西就默认展开：收起来会让人以为参数丢了 */
+  if (fold.length) box.open = true;
+
+  attachFieldSort(wrap, node, zone, box);
+  attachFieldSort(fw, node, zone, box);
+
+  const frag = document.createDocumentFragment();
+  frag.appendChild(wrap);
+  frag.appendChild(box);
+  return frag;
 }
 
 /** 把鼠标底下的那一格找出来（拖拽指示线要贴在它左右） */
@@ -3443,9 +3598,12 @@ function cellAt(wrap, x, y) {
   return null;
 }
 
-function attachFieldSort(wrap, node, zone) {
+function attachFieldSort(wrap, node, zone, foldBox) {
   const cells = () => [...wrap.querySelectorAll(":scope > .field")];
-  const clearMark = () => cells().forEach(c => c.classList.remove("drop-before", "drop-after"));
+  const clearMark = () => {
+    cells().forEach(c => c.classList.remove("drop-before", "drop-after"));
+    wrap.classList.remove("drop-end");
+  };
 
   wrap.addEventListener("dragstart", (e) => {
     const cell = e.target.closest?.(".field");
@@ -3453,6 +3611,8 @@ function attachFieldSort(wrap, node, zone) {
     dragField = { key: cell.dataset.fkey, zone, el: cell };
     cell.classList.add("dragging");
     e.dataTransfer.effectAllowed = "move";
+    /* 拖动一开始就把折叠区展开，否则拖过去看不见落点 */
+    if (foldBox) foldBox.open = true;
     /* 有些环境不给 setData 就当成没拖拽，兜个空串 */
     try { e.dataTransfer.setData("text/plain", cell.dataset.fkey); } catch { /* 忽略 */ }
     try { e.dataTransfer.setDragImage(cell, 24, 24); } catch { /* 忽略 */ }
@@ -3460,7 +3620,9 @@ function attachFieldSort(wrap, node, zone) {
 
   wrap.addEventListener("dragend", () => {
     cells().forEach(c => c.classList.remove("dragging", "drop-before", "drop-after"));
-    wrap.classList.remove("drop-deny");
+    wrap.classList.remove("drop-deny", "drop-end");
+    /* 折叠区里没东西就收起来，别白占一块地方 */
+    if (foldBox && !foldBox.querySelector(":scope > .field-flow > .field")) foldBox.open = false;
     dragField = null;
   });
 
@@ -3477,15 +3639,25 @@ function attachFieldSort(wrap, node, zone) {
     wrap.classList.remove("drop-deny");
     e.dataTransfer.dropEffect = "move";
     const to = cellAt(wrap, e.clientX, e.clientY);
-    if (!to || to.dataset.fkey === dragField.key) { clearMark(); return; }
+    if (!to) {
+      /* 落在格子外的空白（多半是想扔进折叠区）→ 整片高亮，表示会排到这一组最后 */
+      clearMark();
+      wrap.classList.add("drop-end");
+      return;
+    }
+    if (to.dataset.fkey === dragField.key) { clearMark(); return; }
     const r = to.getBoundingClientRect();
     const left = e.clientX < r.left + r.width / 2;
     cells().forEach(c => c.classList.remove("drop-before", "drop-after"));
+    wrap.classList.remove("drop-end");
     to.classList.add(left ? "drop-before" : "drop-after");
   });
 
   wrap.addEventListener("dragleave", (e) => {
-    if (!wrap.contains(e.relatedTarget)) { clearMark(); wrap.classList.remove("drop-deny"); }
+    if (!wrap.contains(e.relatedTarget)) {
+      clearMark();
+      wrap.classList.remove("drop-deny");
+    }
   });
 
   wrap.addEventListener("drop", (e) => {
@@ -3496,17 +3668,29 @@ function attachFieldSort(wrap, node, zone) {
     const from = dragField.key;
     const to = cellAt(wrap, e.clientX, e.clientY);
     clearMark();
-    if (!to || !from || to.dataset.fkey === from) return;
-    const r = to.getBoundingClientRect();
-    const after = e.clientX >= r.left + r.width / 2;
-    const rest = cells().map(c => c.dataset.fkey).filter(k => k !== from);
-    let at = rest.indexOf(to.dataset.fkey);
-    if (at < 0) at = rest.length - 1;
-    rest.splice(after ? at + 1 : at, 0, from);
-    saveFieldOrder(node, zone, rest);
+    wrap.classList.remove("drop-deny");
+    if (!from) return;
+    if (to && to.dataset.fkey === from) return;        // 放回自己身上，什么也不改
+    /* 两个容器的顺序一起算：拖进折叠区 = 从主区摘出来挂到折叠表，拖回主区反过来 */
+    const flows = zoneFlows(node, zone);
+    const keysOf = (w) => (w ? [...w.querySelectorAll(":scope > .field")].map(c => c.dataset.fkey) : []);
+    const mainKeys = keysOf(flows.main).filter(k => k !== from);
+    const foldKeys = keysOf(flows.fold).filter(k => k !== from);
+    const tgt = wrap === flows.fold ? foldKeys : mainKeys;
+    if (to) {
+      const r = to.getBoundingClientRect();
+      const after = e.clientX >= r.left + r.width / 2;
+      let at = tgt.indexOf(to.dataset.fkey);
+      if (at < 0) at = tgt.length - 1;
+      tgt.splice(after ? at + 1 : at, 0, from);
+    } else {
+      tgt.push(from);                                  // 落在空白 / 折叠区空提示上 → 排到这组最后
+    }
+    saveFieldOrder(node, zone, mainKeys, foldKeys);
     renderNode(node);
   });
 }
+
 
 function renderNode(node) {
   if (typeof node === "string") node = S.nodes.find(n => n.id === node);   // 容错：传 id 也认
@@ -3674,12 +3858,16 @@ function renderNode(node) {
       /* 一采、二采各挂一整套 LoRA 时（导演台那种），标题必须写清楚是哪一道 */
       const stages = loraOrder.map(id => stg.get(String(id)) || 0);
       const tagOn = new Set(stages.filter(v => v > 0)).size > 1;
+      /* 一列卡片流：整卡占满一行，缩过的窄条（50 宽）自动并排 —— 顺序照旧 */
+      const flow = document.createElement("div");
+      flow.className = "lora-flow";
       loraOrder.forEach((id, i) => {
-        sb.appendChild(loraCard(node, g.lora.filter(f => f.nodeId === id), i + 1, tagOn ? stages[i] : null));
+        flow.appendChild(loraCard(node, g.lora.filter(f => f.nodeId === id), i + 1, tagOn ? stages[i] : null));
       });
       dormant.forEach((d, i) => {
-        sb.appendChild(loraDormantCard(node, { ...d, idx: `LoRA ${loraOrder.length + i + 1}` }));
+        flow.appendChild(loraDormantCard(node, { ...d, idx: `LoRA ${loraOrder.length + i + 1}` }));
       });
+      sb.appendChild(flow);
       body.appendChild(box);
     }
 
@@ -3758,10 +3946,58 @@ function loraSyncChip(node) {
   return b;
 }
 
+/* LoRA 卡的小型化：叠加链的顺序不能动（改了就换出图结果），但占的地方可以省。
+   缩成一条 50 宽的窄条，只留一颗「复原」；多张能并排，顺序一个字没变。
+   高度记的是缩之前量到的那一个，展开回来还是一模一样。 */
+function loraMiniState(node) {
+  const rec = S.orders?.[orderKeyOf(node)] || {};
+  return {
+    list: Array.isArray(rec.loraMini) ? rec.loraMini.map(String) : [],
+    h: rec.loraMiniH && typeof rec.loraMiniH === "object" ? rec.loraMiniH : {},
+  };
+}
+
+function setLoraMini(node, id, on, h) {
+  const k = orderKeyOf(node);
+  if (!k || id === undefined || id === null) return;
+  S.orders = S.orders || {};
+  const o = S.orders[k] || (S.orders[k] = {});
+  const set = new Set((o.loraMini || []).map(String));
+  if (!o.loraMiniH || typeof o.loraMiniH !== "object") o.loraMiniH = {};
+  if (on) {
+    set.add(String(id));
+    if (h) o.loraMiniH[String(id)] = Math.round(h);
+  } else {
+    set.delete(String(id));
+  }
+  o.loraMini = [...set];
+  save();
+  renderNode(node);
+}
+
+/** 缩小之后的样子：50 宽、高度还是缩之前那个高度，身上只有一颗「复原」 */
+function loraMiniCard(node, info, h) {
+  const card = document.createElement("div");
+  card.className = "lora-card mini";
+  if (h) card.style.height = h + "px";
+  const b = document.createElement("button");
+  b.className = "lora-back";
+  b.innerHTML = "<span>复</span><span>原</span>";
+  b.title = `${info.label} · 已缩小（顺序不变）—— 点一下展开`;
+  b.onclick = (e) => { e.stopPropagation(); setLoraMini(node, info.id, false); };
+  card.appendChild(b);
+  return card;
+}
+
 function loraCard(node, fs, idx, pass) {
   const id = fs[0]?.nodeId;
   const nd = node.prompt[id] || {};
   const off = !!id && (node.assetOff || []).includes(String(id));
+  /* 缩过的卡：直接出窄条，里面的输入框一概不画（改不了也不该占地方） */
+  const ms = loraMiniState(node);
+  if (ms.list.includes(String(id))) {
+    return loraMiniCard(node, { id, label: `LoRA ${idx} · ${nd.class_type || ""}` }, ms.h[String(id)]);
+  }
   const card = document.createElement("div");
   card.className = "lora-card" + (off ? " off" : "");
 
@@ -3772,6 +4008,16 @@ function loraCard(node, fs, idx, pass) {
     + `<span class="lora-idx">LoRA ${idx}</span>`
     + (off ? `<span class="lora-off-tag">已停用</span>` : "")
     + `<span class="lora-cls">${esc(String(nd.class_type || ""))}</span>`;
+  /* 缩小按钮：只影响摆放，顺序与参数一个字都不动 */
+  const miniBtn = document.createElement("button");
+  miniBtn.className = "lora-mini-btn";
+  miniBtn.textContent = "⊟";
+  miniBtn.title = "缩小成小方块（顺序不变，只省地方）";
+  miniBtn.onclick = (e) => {
+    e.stopPropagation();
+    setLoraMini(node, id, true, card.offsetHeight);
+  };
+  head.appendChild(miniBtn);
   card.appendChild(head);
 
   const byName = new Map(fs.map(f => [f.name, f]));
@@ -3858,12 +4104,26 @@ function dormantLoras(node) {
 }
 
 function loraDormantCard(node, info) {
+  /* 停用的 LoRA 也是 LoRA，一样能缩小 */
+  const ms = loraMiniState(node);
+  if (info.id !== undefined && info.id !== null && ms.list.includes(String(info.id))) {
+    return loraMiniCard(node, { id: info.id, label: `${info.idx} · ${info.cls}` }, ms.h[String(info.id)]);
+  }
   const card = document.createElement("div");
   card.className = "lora-card off";
   const head = document.createElement("div");
   head.className = "lora-head";
   head.innerHTML = `<span class="lora-idx">${esc(info.idx)}</span>`
     + `<span class="lora-cls">${esc(info.cls)}</span>`;
+  const miniBtn = document.createElement("button");
+  miniBtn.className = "lora-mini-btn";
+  miniBtn.textContent = "⊟";
+  miniBtn.title = "缩小成小方块（顺序不变，只省地方）";
+  miniBtn.onclick = (e) => {
+    e.stopPropagation();
+    setLoraMini(node, info.id, true, card.offsetHeight);
+  };
+  head.appendChild(miniBtn);
   card.appendChild(head);
   card.appendChild(loraOps(node, info.id, true));
 

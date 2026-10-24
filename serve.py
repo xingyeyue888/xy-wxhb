@@ -29,8 +29,10 @@ import posixpath
 import shutil
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -417,6 +419,98 @@ def lib_delete_dir(kind, sub):
 
 
 # ----------------------------------------------------------------------------
+# 启动 ComfyUI（顶栏那个按钮）
+# ----------------------------------------------------------------------------
+# 浏览器没有「运行本机程序」的权限，所以这件事只能由本地服务来做：
+# 画布点一下 → 这里 subprocess 起进程 → 画布轮询 8188 等它就绪。
+#
+# 绑定关系存用户目录，不跟着仓库走：换一份画布副本、清空 localStorage 都不用重绑。
+LAUNCH_CFG = os.path.join(os.path.expanduser("~"), ".xy-wxhb-launcher.json")
+
+# 只认这几种。别的一律不执行 —— 这个接口只做「运行你绑定的那一个文件」
+LAUNCH_EXT = (".bat", ".cmd", ".exe", ".lnk")
+
+# 选择框必须另开一个进程跑 tkinter：HTTP 请求线程里建 Tk 会报
+# "main thread is not in main loop"，而且对话框一弹就把那个线程占死了。
+_PICK_CODE = r'''
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception as e:
+    sys.stdout.write("ERR:" + str(e)); sys.exit(0)
+r = tk.Tk(); r.withdraw(); r.attributes("-topmost", True)
+p = filedialog.askopenfilename(
+    title="选择 ComfyUI 的启动文件（.bat / .exe / .lnk）",
+    filetypes=[("启动文件", "*.bat *.cmd *.exe *.lnk"), ("所有文件", "*.*")])
+r.destroy()
+sys.stdout.write(p or "")
+'''
+
+
+def launch_kind(p):
+    """绑的是「启动器」还是「ComfyUI 本身」。
+    秋叶绘世这类第三方启动器：点开只是把启动器窗口叫出来，
+    ComfyUI 还得在启动器里点一下 —— 提示语得分开说，否则人会干等着。"""
+    b = os.path.basename(p or "").lower()
+    if any(k in b for k in ("启动器", "绘世", "launcher", "启动台")):
+        return "launcher"
+    return "app"
+
+
+def launch_cfg():
+    try:
+        with open(LAUNCH_CFG, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    p = str(d.get("path") or "").strip()
+    return {"path": p, "exists": bool(p) and os.path.exists(p), "kind": launch_kind(p)}
+
+
+def launch_bind(path):
+    path = (path or "").strip().strip('"')
+    if not path:
+        raise ValueError("路径是空的")
+    if not os.path.isfile(path):
+        raise ValueError("这个文件不存在：" + path)
+    if os.path.splitext(path)[1].lower() not in LAUNCH_EXT:
+        raise ValueError("只支持 .bat / .cmd / .exe / .lnk")
+    with open(LAUNCH_CFG, "w", encoding="utf-8") as f:
+        json.dump({"path": path, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                  f, ensure_ascii=False, indent=1)
+    return launch_cfg()
+
+
+def launch_pick():
+    r = subprocess.run([sys.executable, "-c", _PICK_CODE],
+                       capture_output=True, text=True, timeout=600)
+    out = (r.stdout or "").strip()
+    if out.startswith("ERR:"):
+        raise ValueError("弹不出选择框（" + out[4:] + "）")
+    return out
+
+
+def launch_run():
+    cfg = launch_cfg()
+    p = cfg["path"]
+    if not p:
+        raise ValueError("还没绑定启动文件")
+    if not cfg["exists"]:
+        raise ValueError("绑定的文件不在了：" + p)
+    ext = os.path.splitext(p)[1].lower()
+    d = os.path.dirname(p) or ROOT
+    if ext == ".lnk":
+        os.startfile(p)                          # 跟双击一样，走系统关联
+    elif ext in (".bat", ".cmd"):
+        # 单开一个控制台窗口，别把服务卡在子进程上；start 让 bat 自己跑
+        subprocess.Popen(["cmd", "/c", "start", "", p], cwd=d, shell=False)
+    else:
+        subprocess.Popen([p], cwd=d)
+    return {**cfg, "started": True}
+
+
+# ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -463,12 +557,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path.startswith("/api/lib/"):
             return self._lib_get(u)
+        if u.path.startswith("/api/launch"):
+            return self._launch_get(u)
         return super().do_GET()
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         if u.path.startswith("/api/lib/"):
             return self._lib_post(u)
+        if u.path.startswith("/api/launch"):
+            return self._launch_post(u)
         self._json({"error": "not found"}, 404)
 
     def do_DELETE(self):
@@ -476,6 +574,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if u.path.startswith("/api/lib/"):
             return self._lib_delete(u)
         self._json({"error": "not found"}, 404)
+
+    # ---------- 启动 ComfyUI ----------
+    def _launch_get(self, u):
+        tail = u.path[len("/api/launch"):].strip("/")
+        try:
+            if tail in ("", "state"):
+                return self._json({"ok": True, **launch_cfg()})
+            return self._json({"error": "not found"}, 404)
+        except Exception as e:
+            return self._json({"error": str(e)}, 500)
+
+    def _launch_post(self, u):
+        tail = u.path[len("/api/launch"):].strip("/")
+        try:
+            if tail == "pick":                   # 弹系统选择框，返回选中的路径
+                return self._json({"ok": True, "path": launch_pick()})
+            if tail == "bind":                   # 手填路径也认
+                return self._json({"ok": True, **launch_bind(self._body().get("path"))})
+            if tail == "run":                    # 启动已绑定的那个文件
+                return self._json({"ok": True, **launch_run()})
+            return self._json({"error": "not found"}, 404)
+        except Exception as e:
+            return self._json({"error": str(e)}, 400)
 
     def _lib_get(self, u):
         q = self._q(u)

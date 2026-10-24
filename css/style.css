@@ -127,6 +127,13 @@ html, body {
 .btn.active { background: var(--bg-3); border-color: var(--accent); color: var(--txt); }
 .btn.danger:hover { border-color: var(--err); color: var(--err); }
 
+/* 顶栏的「启动 ComfyUI」：绿调，跟旁边那个蓝色「连接」分开 —— 
+   一个是把程序叫起来，一个是连上去，别让人以为重复了 */
+.btn-launch { background: #1c2a22; border-color: #2f4a3c; color: #a8d8bd; flex: none; }
+.btn-launch:hover { background: #24352a; border-color: #3f6453; color: #c8ecd8; }
+.btn-launch.busy { opacity: .55; cursor: default; }
+.btn-launch.waiting { color: #ffd08a; border-color: #5c4a2a; background: #2a2318; }
+
 .icon-btn {
   background: none; border: none; color: var(--txt-2);
   cursor: pointer; font-size: 15px; padding: 2px 6px; border-radius: 6px;
@@ -655,6 +662,35 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 }
 /* 200 宽的格子里，节点角标别把名字挤没了 */
 .field-flow > .field .node-tag { max-width: 46%; font-size: 8px; line-height: 12px; }
+/* 拖到格子外的空白（多半是想扔进折叠区）：整片描一圈蓝虚线，表示会排到这一组最后 */
+.field-flow.drop-end { outline: 1px dashed var(--accent); outline-offset: 3px; border-radius: 8px; }
+
+/* ============ 「更多参数」折叠区 ============
+   参数区 / 模型区底部那一条：不常用的格子拖进去就收在这儿，还能拖回来。
+   归属和顺序都记在 S.orders 里（zone 是主区、zone+"Fold" 是折叠区）。 */
+.fold-box {
+  border: 1px dashed #2b323d; border-radius: 8px;
+  background: #171b21; padding: 5px 7px 7px;
+}
+.fold-box > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px;
+  font-size: 10.5px; color: var(--txt-3);
+}
+.fold-box > summary::-webkit-details-marker { display: none; }
+.fold-box > summary::before { content: "▸"; font-size: 9px; line-height: 1; }
+.fold-box[open] > summary::before { content: "▾"; }
+.fold-box > summary:hover { color: #9aa3b2; }
+.fold-box .fold-n {
+  min-width: 15px; text-align: center; font-size: 9.5px;
+  background: #262e39; color: #8c96a4; border-radius: 4px; padding: 0 4px;
+}
+.fold-box .fold-tip { margin-left: auto; font-size: 9.5px; color: #4f5a68; }
+.fold-box > .field-flow { margin-top: 6px; }
+.fold-empty {
+  width: 100%; padding: 14px 6px; text-align: center;
+  font-size: 10px; color: #4f5a68;
+  border: 1px dashed #262d37; border-radius: 7px;
+}
 /* 一采 / 二采分色：混在一片里也能一眼看出哪几格属于哪一道 */
 .pass-mini.p1 { background: #22344d; color: #8fb8f0; }
 .pass-mini.p2 { background: #3a2c1e; color: #e0b07a; }
@@ -738,6 +774,31 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
   border: 1px solid var(--line); border-radius: 7px;
   background: #1a1e25; padding: 6px 7px 7px;
 }
+
+/* ============ LoRA 区：卡能缩成窄条 ============
+   叠加链的顺序不能动，但占的地方可以省。缩过的卡是 50 宽的窄条，
+   高度还是缩之前那一个，多张窄条自动并排 —— 顺序一个字没变。 */
+.lora-flow { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.lora-flow > .lora-card { flex: 0 0 100%; }
+.lora-flow > .lora-card.mini {
+  flex: 0 0 50px; width: 50px; min-width: 50px; box-sizing: border-box;
+  padding: 4px; align-items: center; justify-content: center; gap: 0;
+}
+.lora-back {
+  width: 100%; height: 100%; cursor: pointer; border-radius: 5px;
+  background: #232a34; border: 1px solid #313a46; color: #9aa6b6;
+  font-size: 11px; letter-spacing: 1px; line-height: 1.4;
+  font-family: inherit;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.lora-back:hover { background: #2c3542; border-color: var(--accent); color: #cfe0ff; }
+.lora-back span { display: block; }
+.lora-mini-btn {
+  flex: none; width: 17px; height: 17px; padding: 0; line-height: 1;
+  border-radius: 4px; cursor: pointer; font-size: 10px; font-family: inherit;
+  background: #232a34; border: 1px solid #313a46; color: #8d97a5;
+}
+.lora-mini-btn:hover { background: #2c3542; color: #c3ccd8; border-color: #46525f; }
 .lora-head { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .lora-idx { font-size: 10px; color: var(--txt-2); font-weight: 600; flex: none; }
 .lora-cls {
