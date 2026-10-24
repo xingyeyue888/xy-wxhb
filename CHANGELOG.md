@@ -2,6 +2,32 @@
 
 版本号写在 `VERSION` 文件里，打包脚本和 `serve.py` 都读它。
 
+## v1.1.6 — 2026-10-24
+
+有些格子摆着没用，有用的那格却埋在「更多参数」里 —— 现在可以点名让它们换位置。
+
+**新增：面板字段顶替（`FIELD_PLAN`）**
+
+工作流里总有几个参数是「写了也不动」的：MOSS 文生图里 `TextGenerate` 的
+`max_length` 恒为 4096（提示词就一两百字），h3 长视频里放大器的 `aspect_policy`
+恒为 `preserve_source`（画幅由上游决定）。它们各占一格；而真正要动手的那两格
+—— `ComfySwitchNode` 的提示词增强开关、一采的 `noise_seed` —— 却沉在「更多参数」里。
+
+`js/app.js` 新增一张 `FIELD_PLAN` 表，按「工作流文件名 + 源节点类名 + 字段名」登记：
+
+| 工作流 | 让位 | 顶上来 | 面板显示名 |
+| --- | --- | --- | --- |
+| MOSS 文生图 | `TextGenerate.max_length`（4096） | `ComfySwitchNode.switch` | 提示词增强 |
+| h3 长视频 | `LearnedLatentUpscale….aspect_policy`（preserve_source） | `RandomNoise.noise_seed` | 一采噪声种子 |
+
+顶替只改「怎么显示」：字段的 `nodeId` / `name` / `key` 一个字没动，
+写回照旧走 `queueParamPush`，协议与其它参数完全一致（实测 switch→false、
+noise_seed→12345 都完整落盘）。顶替上来的格子会**继承了让位那格的归类**，
+所以它真的站在原来的位置上，而不是换个名字又沉回去。工作流里要是没有那个节点，
+整条规则跳过 —— 宁可不顶替，也不能把人唯一能改的格子白摘掉。
+
+要再加一处顶替，往 `FIELD_PLAN` 里添一条即可。
+
 ## v1.1.5 — 2026-10-24
 
 写进去了，又被打回来 —— 现在会直说是谁打的。

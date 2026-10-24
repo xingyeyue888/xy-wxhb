@@ -1397,6 +1397,67 @@ function buildFields(node) {
       });
     }
   }
+  return applyFieldPlan(node, out);
+}
+
+/* ==================================================================
+   面板字段顶替（按工作流定制）
+   ──────────────────────────────────────────────────────────────────
+   节点自带的一些参数在画布上根本没有意义 —— TextGenerate 的 max_length
+   固定 4096（提示词就一两百字，谁也不会去改），放大器的 aspect_policy
+   固定 preserve_source（画幅由上游决定，改成别的反而出错）。它们各占一格，
+   而真正要动手的那一格（提示词增强开关、一采噪声种子）却埋在「更多参数」里。
+
+   这里登记「谁让位、谁顶上来、顶上来叫什么」：
+
+     wf     只在这些工作流里生效（按文件名匹配，同款节点在别的流里不受影响）
+     drop   让位的那一格：从面板上摘掉，不再显示
+     take   顶替它的那一格：站到 drop 原来的位置，归类也跟着 drop 走
+     label  顶替之后在面板上显示的名字
+
+   顶替只动「怎么显示」：take 的 nodeId / name / key 一个字没改，
+   所以写回照旧走 queueParamPush —— 协议与其它参数完全一样。
+   要加新的顶替，往这个表里再添一条即可。
+================================================================== */
+const FIELD_PLAN = [
+  {
+    /* MOSS 文生图（主人 2026-10-24 指定）：提示词增强的真假开关顶掉「最大长度 4096」 */
+    wf: /MOSS.*文生图/i,
+    drop: { cls: /^TextGenerate$/, field: "max_length" },
+    take: { cls: /^ComfySwitchNode$/, field: "switch" },
+    label: "提示词增强",
+  },
+  {
+    /* h3 长视频（主人 2026-10-24 指定）：一采的噪声种子顶掉放大器的「画幅策略」。
+       画幅策略恒为 preserve_source，摆着只会让人以为改得动 */
+    wf: /h3.*长视频/i,
+    drop: { cls: /LearnedLatentUpscale/i, field: "aspect_policy" },
+    take: { cls: /^RandomNoise$/, field: "noise_seed" },
+    label: "一采噪声种子",
+  },
+];
+
+function applyFieldPlan(node, out) {
+  const file = String(node?.file || "");
+  if (!file || !out.length) return out;
+  for (const p of FIELD_PLAN) {
+    if (p.wf && !p.wf.test(file)) continue;
+    /* 工作流里根本没有 take 那个节点（换了版本 / 换了流）就整条跳过 ——
+       宁可不顶替，也不能把人唯一能改的那一格白白藏掉 */
+    const take = out.find(f => p.take.cls.test(f.cls) && f.name === p.take.field);
+    if (!take) continue;
+    if (p.label) take.label = p.label;
+    /* 这一格要顶到面板正面来，就不能再挂着「画布不提供编辑」的锁 */
+    take.locked = "";
+    const di = out.findIndex(f => p.drop.cls.test(f.cls) && f.name === p.drop.field);
+    if (di < 0) continue;                 // 没有让位的，take 留在原处，只是换了个名字
+    /* 顶替谁就站进谁的堆里（尺寸 / 画幅 / 采样…）：位置与归类一起接过来 */
+    take._grp = classify(out[di]);
+    out.splice(out.indexOf(take), 1);     // 先把 take 从原位置摘掉，免得插重
+    const si = out.findIndex(f => p.drop.cls.test(f.cls) && f.name === p.drop.field);
+    if (si >= 0) out.splice(si, 1, take);
+    else out.push(take);
+  }
   return out;
 }
 
@@ -1648,6 +1709,9 @@ const PARAM_CN_LOWER = new Map(Object.entries(PARAM_CN).map(([k, v]) => [k.toLow
 
 /** 参数名 → 中文（认不出来就原样返回英文） */
 function cnName(f) {
+  /* FIELD_PLAN 指定过显示名的（提示词增强 / 一采噪声种子），直接用那个名字，
+     不再走「英文拆词翻译」那套 —— switch 翻不出人话 */
+  if (f?.label) return f.label;
   /* 泛名 widget 先按节点标题换成有含义的名字（value + 「Float (duration)」→ duration） */
   const raw = String(semName(f) ?? "");
   const key = raw.toLowerCase();
@@ -1780,6 +1844,9 @@ function nodeLabel(node, nid) {
 /** 参数分组：asset=素材 · main=主提示词 · size/sample=参数 · model=模型 · lora=LoRA · other=其余
  *  顺序由 renderNode 决定：① 素材 → ② 参数设置 → ③ LoRA → ④ 模型选择 */
 function classify(f) {
+  /* 被 FIELD_PLAN 顶替上来的那一格：跟着让位的字段归类，
+     这样它才真的站在原来的位置，而不是又沉回「更多参数」里 */
+  if (f?._grp) return f._grp;
   if (isLoraField(f)) return "lora";
   if (f.type === "STRING" && RE_PROMPT.test(f.name)) return "main";
   const tt = targetType(f);
