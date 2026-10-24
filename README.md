@@ -7,15 +7,15 @@
 v1.1.11 · 源码公开 · 仅限非商业使用 · Windows / macOS / Linux
 ```
 
-🎬 **完整功能演示（3 分 22 秒，无旁白）**：[`docs/xy-wxhb-full-demo.mp4`](docs/xy-wxhb-full-demo.mp4)
+🎬 **完整功能演示（3 分 22 秒，无旁白）**：（视频暂未随仓库分发）
 —— 从「先开 ComfyUI 再开画布」讲起：连接 → 工作流库 / 素材库 → 顶栏 → 工作流节点的端口与分区
 → 文本节点连线 → 图像节点真跑一次（本机 RTX 50 系，9× 加速）→ 图接图生视频 → 参数双向写回
 → 产出存到成品库。全程强调一件事：**画布不加载模型、不占显存、不另存素材，全在你自己的 ComfyUI 里。**
 
-🎙️ **配音稿**：[`docs/xy-wxhb-full-demo-解说稿.md`](docs/xy-wxhb-full-demo-解说稿.md)
+🎙️ **配音稿**：（暂未随仓库分发）
 —— 按幕分好起止时间码与字数，可逐幕配，也可直接念末尾的「连读版」。
 
-🎬 **单工作流速览（47 秒）**：[`docs/xy-wxhb-demo.mp4`](docs/xy-wxhb-demo.mp4)
+🎬 **单工作流速览（47 秒）**：（视频暂未随仓库分发）
 —— 工作流上画布 → 改参数自动写回 → 提示词连线 → 平移缩放框选 → 开跑与随时停止。
 
 两支片子里的操作全部是真实操作，不是动画模拟。
@@ -622,8 +622,7 @@ xy-wxhb/
 ├── VERSION           版本号（唯一来源，打包脚本和 serve.py 都读它）
 ├── build-release.py  打绿色包：dist/xy-wxhb-vX.Y.Z.zip + .sha256
 ├── LICENSE           PolyForm Noncommercial 1.0.0（源码公开，禁止商用）
-├── comfy-root.txt    ComfyUI 根目录（手动指定后生成，不进仓库）
-└── docs/             早期界面截图（当前 README 未引用，默认不打进发布包）
+└── comfy-root.txt    ComfyUI 根目录（手动指定后生成，不进仓库）
 ```
 
 > `start.bat` 里**不能出现中文**：cmd 按 GBK 解析 .bat，UTF-8 中文会被切成乱码
