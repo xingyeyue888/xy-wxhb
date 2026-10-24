@@ -428,7 +428,9 @@ html, body {
 /* ============ 节点 ============ */
 .node {
   position: absolute;
-  width: 360px;
+  /* 470 宽：参数格固定 200×50，一行正好摆两格（200×2 + 间隙 + 两侧内边距）。
+     窄到 360 只能挤一列，面板会拖得特别长 */
+  width: 470px;
   min-width: 200px;
   min-height: 84px;
   background: var(--node);
@@ -589,6 +591,74 @@ body.day .nbtn.run.stop { background: #f2cccc; color: #a82424; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 /* 参数是单数时，最后一格横跨两列把空位占掉，右下角不再留半格白 */
 .grid2 > *:last-child:nth-child(odd) { grid-column: 1 / -1; }
+
+/* ============ 固定尺寸的参数格 · 区内自由排序 ============
+   四区（素材 / 参数 / LoRA / 模型）是硬边界，区内的格子能拖着换位置。
+   格子统一 200×50：宽固定，一行能摆几个看节点多宽（flex-wrap 自己折）；
+   高固定，标签一行 + 控件一行，正好塞满。多行文本（提示词）除外 —— 压进
+   50 高只剩一条缝，写不了字，所以它横跨整行、高度自适应。 */
+.field-flow { display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; }
+.field-flow > .field {
+  flex: 0 0 200px; width: 200px; height: 50px; box-sizing: border-box;
+  padding: 3px 5px 4px; border-radius: 7px; gap: 2px;
+  justify-content: space-between; overflow: hidden;
+  /* 比区底色再深一档：每个项目都得看得出是一个独立的小格 */
+  background: #14181e; border: 1px solid #2e3742;
+  transition: border-color .12s, background .12s;
+}
+.field-flow > .field:hover { border-color: #46525f; background: #182028; }
+.field-flow > .field.cell-wide { flex: 1 1 100%; width: 100%; height: auto; }
+/* 标签这一行是拖动把手 */
+.field-flow > .field > .field-head { flex: none; cursor: grab; gap: 4px; }
+.field-flow > .field > .field-head:active { cursor: grabbing; }
+.field-flow > .field .lbl-cn { font-size: 10.5px; }
+.field-flow > .field .lbl-en { font-size: 9px; max-width: 40%; }
+/* 控件压到一行高，剩下的高度留给标签 */
+.field-flow > .field > textarea,
+.field-flow > .field > input[type=text],
+.field-flow > .field > input[type=number],
+.field-flow > .field > select {
+  height: 23px; min-height: 0; padding: 1px 5px; font-size: 11.5px; flex: none;
+}
+.field-flow > .field > input[type=checkbox] { margin: 1px 0 2px 3px; accent-color: var(--accent); }
+/* 深色格子里默认的白方块太扎眼，自绘一个：未选是空框，选了是蓝底白勾 */
+.field-flow > .field > input[type=checkbox] {
+  appearance: none; width: 15px; height: 15px; border-radius: 4px;
+  border: 1px solid #3a4553; background: #0f1319; cursor: pointer; flex: none;
+}
+.field-flow > .field > input[type=checkbox]:hover { border-color: #55606e; }
+.field-flow > .field > input[type=checkbox]:checked {
+  border-color: var(--accent);
+  background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.4 8.4l2.9 2.9 6.3-6.3' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/12px no-repeat;
+}
+/* 「可拖」标记：提示这一区能自己排，只看一眼就懂 */
+.zone-tip {
+  font-style: normal; font-size: 9px; font-weight: 400; color: #5f6a78;
+  margin-left: 6px; padding: 0 4px; border: 1px solid #313a46; border-radius: 4px;
+}
+/* 多行文本那一格高度自适应：提示词得写得下，不能压成一条缝 */
+.field-flow > .field.cell-wide > textarea { height: auto; min-height: 54px; }
+/* 「由上游算出」「来自某节点」这类只读条，同样压进一行 */
+.field-flow > .field > .wired { height: 23px; padding: 2px 6px; font-size: 10.5px; }
+.field-flow > .field > .port.in { left: -14px; top: 16px; }
+
+/* 拖动中：原格淡出，落点边上一条蓝线 */
+.field-flow > .field.dragging { opacity: .4; }
+.field-flow > .field.drop-before { box-shadow: inset 2px 0 0 0 var(--accent); }
+.field-flow > .field.drop-after { box-shadow: inset -2px 0 0 0 var(--accent); }
+/* 拖到别的区：整片描一圈红虚线 —— 这一区不收，落下也没用 */
+.field-flow.drop-deny { outline: 1px dashed #7a3f3f; outline-offset: 3px; border-radius: 8px; }
+/* 帧数换算的小提示：缩成一个 ⓘ，不再单占一行 */
+.hint-i {
+  flex: none; font-style: normal; font-size: 9.5px; line-height: 1;
+  color: var(--txt-3); cursor: help;
+}
+/* 200 宽的格子里，节点角标别把名字挤没了 */
+.field-flow > .field .node-tag { max-width: 46%; font-size: 8px; line-height: 12px; }
+/* 一采 / 二采分色：混在一片里也能一眼看出哪几格属于哪一道 */
+.pass-mini.p1 { background: #22344d; color: #8fb8f0; }
+.pass-mini.p2 { background: #3a2c1e; color: #e0b07a; }
+.pass-mini.p3 { background: #233a2c; color: #8fd0a8; }
 
 /* 字段标签：中文为主，英文原名缩成右侧小字 */
 .field-head .lbl-cn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

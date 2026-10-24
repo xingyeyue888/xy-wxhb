@@ -20,6 +20,9 @@ const S = {
   kindFilter: "all",
   search: "",
   restoring: false,             // 正在从 localStorage 恢复节点
+  /* 参数格 / 模型格的排列顺序：{ 工作流文件名: { param: [字段key…], model: […] } }。
+     按文件记而不是按节点记 —— 同一个工作流删掉再加回来，排好的顺序还在 */
+  orders: {},
   lib: {                        // 素材库
     tab: localStorage.getItem("xy-wxhb.tab") || "wf",
     kind: localStorage.getItem("xy-wxhb.libkind") || "input",
@@ -2091,12 +2094,16 @@ function fieldControl(f, node, opt) {
   /* 记一笔「这一格叫什么中文」：写回成功的提示要用它，
      不然 toast 里蹦出来的是 values.a 这种内部字段名 */
   if (node) (node._cn || (node._cn = {}))[f.key] = cnBody;
-  const tag = f._pass ? `<em class="pass-mini">${pcn}</em>` : "";
+  /* 一采 / 二采用小色块分色：格子固定 200 宽，光靠两个字分不出来，
+     分色之后一眼就能看出这一片属于哪一道 */
+  const tag = f._pass ? `<em class="pass-mini p${f._pass}">${pcn}</em>` : "";
   /* 右边要挂节点角标时就不摆英文原名了 —— 一行里塞三个东西谁也看不清，
      何况角标里本来就是节点的英文类名 */
   const hasNodeTag = !!(opt && opt.tag);
   label.innerHTML = `<span class="lbl-cn">${tag}${esc(cnBody)}</span>`
     + (!hasNodeTag && cnBody !== f.name ? `<span class="lbl-en">${esc(f.fromPrim ? f.title : f.name)}</span>` : "");
+  /* 200 宽装不下长名字（「参考图尺寸策略」这类），截断了就得能悬停看全名 */
+  label.title = cnBody;
 
   const head = document.createElement("div");
   head.className = "field-head";
@@ -2110,12 +2117,17 @@ function fieldControl(f, node, opt) {
     t.title = "这一格属于「" + opt.tag + "」节点";
     head.appendChild(t);
   }
+  /* 标签这一行就是拖动把手：整格可拖的话，点选输入框里的字会被当成拖拽 */
+  head.draggable = true;
+  head.title = head.title || "按住拖动，可以在本区内换位置";
   wrap.appendChild(head);
+  /* 帧数换算的提示缩成一个 ⓘ：格子固定 50 高，再占一行就装不下了 */
   if (f._durHint) {
-    const h = document.createElement("div");
-    h.className = "hint-tip";
-    h.textContent = "帧数由这一格自动换算";
-    wrap.appendChild(h);
+    const h = document.createElement("i");
+    h.className = "hint-i";
+    h.textContent = "ⓘ";
+    h.title = "帧数由这一格自动换算";
+    head.appendChild(h);
   }
   const tt = targetType(f);
   if (tt) {
@@ -3332,6 +3344,170 @@ function ensureNodeVisible(node) {
   view.apply();
 }
 
+/* ==================================================================
+   四大区 · 区内自由排序
+   ──────────────────────────────────────────────────────────────────
+   工作流节点的正文分成四块，边界是硬的：**素材 / 参数 / LoRA / 模型**。
+   区内的格子可以拖着换位置，但拖不出这一区 —— 分类本身就说明它们是
+   不同性质的东西，参数混进模型堆里只会更难找。
+
+     · 参数区与模型区：格子随意排。这两片「谁先谁后」不影响出图，
+       纯属个人习惯（有人先看画幅，有人先看步数）。
+     · 素材区与 LoRA 区：不给拖。素材顺序就是参考图编号（image1 / image2），
+       LoRA 顺序就是叠加链的先后 —— 顺序一乱，出图结果就变了，
+       这不是排版的自由，是改参数。
+
+   顺序按「工作流文件名 → 字段 key 列表」记在 S.orders 里：
+   重开画布、把节点删掉再加回来，排好的那一版都还在。
+   工作流改版加了新参数时，认不出来的那些按原相对次序追加到末尾，
+   不会把现有顺序打乱。
+================================================================== */
+const FIELD_ZONES = { param: "参数", model: "模型" };
+
+/** 这份工作的排序记录挂在工作流文件名上（换节点不丢） */
+function orderKeyOf(node) {
+  return String(node?.file || node?.name || "");
+}
+
+/** 按记下的顺序重排；没记过就是原顺序，新字段追加在尾部 */
+function orderedFields(node, zone, seq) {
+  const saved = S.orders?.[orderKeyOf(node)]?.[zone];
+  if (!Array.isArray(saved) || !saved.length) return seq;
+  const pos = new Map(saved.map((k, i) => [k, i]));
+  return seq
+    .map((f, i) => ({ f, i, p: pos.has(f.key) ? pos.get(f.key) : 1e6 + i }))
+    .sort((a, b) => a.p - b.p || a.i - b.i)
+    .map((x) => x.f);
+}
+
+function saveFieldOrder(node, zone, keys) {
+  const k = orderKeyOf(node);
+  if (!k) return;
+  S.orders = S.orders || {};
+  (S.orders[k] || (S.orders[k] = {}))[zone] = keys;
+  save();
+}
+
+/** 多行文本（提示词 / 系统提示词）没法压进 200×50：压进去只剩一条缝，写不了字 */
+function isWideField(f) {
+  if (classify(f) === "main") return true;
+  const v = f?.value;
+  return typeof v === "string" && (v.includes("\n") || v.length > 40);
+}
+
+/** 重名的格子（四个「帧数」、两个「分段模式」）得挂节点角标，否则长得一模一样 */
+function tagMaker(node, fields) {
+  const cnt = new Map();
+  for (const f of fields) { const n = cnName(f); cnt.set(n, (cnt.get(n) || 0) + 1); }
+  const needIds = [];
+  for (const f of fields) if (cnt.get(cnName(f)) > 1 && !needIds.includes(f.nodeId)) needIds.push(f.nodeId);
+  const baseCnt = new Map();
+  for (const nid of needIds) { const b = nodeLabel(node, nid); baseCnt.set(b, (baseCnt.get(b) || 0) + 1); }
+  const seen = new Map();
+  const nameOf = new Map();
+  for (const nid of needIds) {
+    const b = nodeLabel(node, nid);
+    const i = (seen.get(b) || 0) + 1;
+    seen.set(b, i);
+    /* 序号放前面：角标窄的时候尾巴会被省略号吃掉 */
+    nameOf.set(nid, baseCnt.get(b) > 1 ? `#${i} ${b}` : b);
+  }
+  return (f) => (cnt.get(cnName(f)) > 1 ? { tag: nameOf.get(f.nodeId) } : null);
+}
+
+/* 正在拖的那一格：只在一次拖拽期间有效 */
+let dragField = null;
+
+/** 区内容器：一堆固定尺寸的格子，可拖着换位置 */
+function fieldFlow(node, fields, zone, tagOf) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-flow";
+  wrap.dataset.zone = zone;
+  for (const f of orderedFields(node, zone, fields)) {
+    const cell = fieldControl(f, node, tagOf ? tagOf(f) : null);
+    cell.classList.add("cell");
+    if (isWideField(f)) cell.classList.add("cell-wide");
+    cell.dataset.fkey = f.key;
+    wrap.appendChild(cell);
+  }
+  attachFieldSort(wrap, node, zone);
+  return wrap;
+}
+
+/** 把鼠标底下的那一格找出来（拖拽指示线要贴在它左右） */
+function cellAt(wrap, x, y) {
+  for (const c of wrap.querySelectorAll(":scope > .field")) {
+    const r = c.getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return c;
+  }
+  return null;
+}
+
+function attachFieldSort(wrap, node, zone) {
+  const cells = () => [...wrap.querySelectorAll(":scope > .field")];
+  const clearMark = () => cells().forEach(c => c.classList.remove("drop-before", "drop-after"));
+
+  wrap.addEventListener("dragstart", (e) => {
+    const cell = e.target.closest?.(".field");
+    if (!cell || cell.parentElement !== wrap) return;
+    dragField = { key: cell.dataset.fkey, zone, el: cell };
+    cell.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    /* 有些环境不给 setData 就当成没拖拽，兜个空串 */
+    try { e.dataTransfer.setData("text/plain", cell.dataset.fkey); } catch { /* 忽略 */ }
+    try { e.dataTransfer.setDragImage(cell, 24, 24); } catch { /* 忽略 */ }
+  });
+
+  wrap.addEventListener("dragend", () => {
+    cells().forEach(c => c.classList.remove("dragging", "drop-before", "drop-after"));
+    wrap.classList.remove("drop-deny");
+    dragField = null;
+  });
+
+  wrap.addEventListener("dragover", (e) => {
+    if (!dragField) return;
+    /* 跨区不接：不 preventDefault、光标给「禁止」、整片描一圈红虚线。
+       光靠「放下去没反应」说明不了问题，得当场看出来这一区不收 */
+    if (dragField.zone !== zone) {
+      try { e.dataTransfer.dropEffect = "none"; } catch { /* 忽略 */ }
+      wrap.classList.add("drop-deny");
+      return;
+    }
+    e.preventDefault();
+    wrap.classList.remove("drop-deny");
+    e.dataTransfer.dropEffect = "move";
+    const to = cellAt(wrap, e.clientX, e.clientY);
+    if (!to || to.dataset.fkey === dragField.key) { clearMark(); return; }
+    const r = to.getBoundingClientRect();
+    const left = e.clientX < r.left + r.width / 2;
+    cells().forEach(c => c.classList.remove("drop-before", "drop-after"));
+    to.classList.add(left ? "drop-before" : "drop-after");
+  });
+
+  wrap.addEventListener("dragleave", (e) => {
+    if (!wrap.contains(e.relatedTarget)) { clearMark(); wrap.classList.remove("drop-deny"); }
+  });
+
+  wrap.addEventListener("drop", (e) => {
+    /* 拖的是面板里的格子，就别让画布（stage）把它当成拖素材，冒泡到此为止 */
+    if (dragField) e.stopPropagation();
+    if (!dragField || dragField.zone !== zone) { wrap.classList.remove("drop-deny"); return; }
+    e.preventDefault();
+    const from = dragField.key;
+    const to = cellAt(wrap, e.clientX, e.clientY);
+    clearMark();
+    if (!to || !from || to.dataset.fkey === from) return;
+    const r = to.getBoundingClientRect();
+    const after = e.clientX >= r.left + r.width / 2;
+    const rest = cells().map(c => c.dataset.fkey).filter(k => k !== from);
+    let at = rest.indexOf(to.dataset.fkey);
+    if (at < 0) at = rest.length - 1;
+    rest.splice(after ? at + 1 : at, 0, from);
+    saveFieldOrder(node, zone, rest);
+    renderNode(node);
+  });
+}
+
 function renderNode(node) {
   if (typeof node === "string") node = S.nodes.find(n => n.id === node);   // 容错：传 id 也认
   if (!node) return;
@@ -3423,149 +3599,62 @@ function renderNode(node) {
       body.appendChild(box);
     }
 
-    /* ② 参数设置：提示词 + 尺寸 + 采样（按道次分堆）+ 其余参数 */
-    const params = [...g.main, ...g.mode, ...g.front, ...g.when, ...g.size, ...g.sample, ...g.other];
-    if (params.length) {
-      const box = sectionBox(++secNo, "参数设置", params.length, false);
-      const sb = box.querySelector(".sec-body");
-      for (const f of g.main) sb.appendChild(fieldControl(f, node));
-
-      /* 画幅比例、分段模式、时长单独摆一排，紧跟提示词：
-         这三格是「先定框架」的参数 —— 模式决定吃哪种素材，画幅和时长决定宽高、帧数、步数 */
-      const rank = (f) => { const n = semName(f);
+    /* ② 参数：能改的格子全平铺成一张网。
+       一采 / 二采不再各开一块 —— 分块就拖不动了；道次靠格子标签上的小角标认，
+       混着摆也不会认错。排好的顺序记在 S.orders 里，下次打开还在 */
+    const paramFields = (() => {
+      /* 没排过的时候给一版默认顺序：
+         提示词 → 画幅 / 模式 / 时长 → 尺寸与采样（一采在前、二采在后）→ 其余 */
+      const rank = (f) => {
+        const n = semName(f);
         return /^aspect_ratio$/i.test(n) ? 0 : RE_ASPECT.test(n) ? 1
-          : RE_MODE.test(n) ? 2 : 3; };
-      const lead = [...g.front, ...g.mode, ...g.when].sort((a, b) => rank(a) - rank(b));
-      /* 时长是被下游算出来的（h3：length = 表达式(时长)）—— 在时长格里点一句，
-         免得人以为改了这一格帧数没动 */
+          : RE_MODE.test(n) ? 2 : 3;
+      };
+      const lead = [...g.front, ...g.mode, ...g.when].sort((x, y) => rank(x) - rank(y));
+      /* 时长是被下游算出来的（h3：length = 表达式(时长)）—— 那一格挂个小提示，
+         免得人以为改了它帧数没动 */
       const durDriven = [...g.when, ...g.size, ...g.other, ...g.main]
         .some(x => x.driven && RE_DURATION.test(semName(x)));
       for (const f of lead) f._durHint = durDriven && !f.driven && RE_DURATION.test(semName(f));
-      /* 先把尺寸/采样按「道次 → 节点」归堆（只算结构、先不碰 DOM）：
-         · 双采样工作流里「步数 / 种子 / 宽度」两套各有一份，先分道次；
-         · 同一道里还有好几个节点都叫「宽度 / 视频偏移」（导演台 + 偏移调节），
-           所以还得知道每一格是哪个节点的，才能标清楚。
-         先算完，是因为前置行要不要往上补一格，得看下面第一格是谁。 */
+      /* 尺寸与采样按道次排开：一采的在前、二采的在后（只决定默认顺序） */
       const byStage = new Map();
-      const orderOf = new Map();
       for (const f of [...g.size, ...g.sample]) {
         const st = stageOf(f);
-        if (!byStage.has(st)) { byStage.set(st, new Map()); orderOf.set(st, []); }
-        const m = byStage.get(st);
-        if (!m.has(f.nodeId)) m.set(f.nodeId, []);
-        m.get(f.nodeId).push(f);
-        orderOf.get(st).push(f);
+        if (!byStage.has(st)) byStage.set(st, []);
+        byStage.get(st).push(f);
       }
-      /* 只有一道采样时，「共用 / 一采」这种标签纯属添乱 —— 全部并回一堆 */
-      const realStages = new Set([...byStage.keys()].filter(s => s > 0));
-      if (realStages.size <= 1) {
-        const merged = new Map();
-        const mOrder = [];
-        for (const [st, owners] of byStage) {
-          mOrder.push(...orderOf.get(st));
-          for (const [nid, fs] of owners) {
-            if (!merged.has(nid)) merged.set(nid, []);
-            merged.get(nid).push(...fs);
-          }
-        }
-        byStage.clear();
-        byStage.set(0, merged);
-        orderOf.clear();
-        orderOf.set(0, mOrder);
+      const stageSeq = [...byStage.entries()].sort((x, y) => x[0] - y[0])
+        .flatMap(([, v]) => v);
+      /* 只有一道采样时不标道次 —— 「一采」铺满整个面板，等于没说 */
+      if ([...byStage.keys()].filter(s => s > 0).length > 1) {
+        for (const f of stageSeq) f._pass = stageOf(f);
       }
-      const list = [...byStage.entries()].sort((a, b) => a[0] - b[0]);
-      const split = list.length > 1;
-      /* 只有真的重名（分辨率只有一个总像素、五个 VideoCombine 各一个帧率）才标节点名，
-         不重名就老老实实两列摆开，别加没用的字 */
-      const seenLabel = new Map();
-      for (const f of [...g.size, ...g.sample]) {
-        const n = cnName(f);
-        seenLabel.set(n, (seenLabel.get(n) || 0) + 1);
+      return [...g.main, ...lead, ...stageSeq, ...g.other];
+    })();
+    if (paramFields.length || locked.length) {
+      /* 标题右边：项数 + 「可拖」——这一区能自己排，得让人知道 */
+      const right = document.createElement("span");
+      right.className = "sec-right";
+      right.appendChild(document.createTextNode(String(paramFields.length)));
+      if (paramFields.length) {
+        const tip = document.createElement("em");
+        tip.className = "zone-tip";
+        tip.textContent = "可拖";
+        tip.title = "按住格子左边的名字拖动，只能在本区内换位置";
+        right.appendChild(tip);
       }
-      const ambiguous = [...seenLabel.values()].some(v => v > 1);
-      const multiNode = ambiguous && list.reduce((n, [, m]) => n + m.size, 0) > 1;
-      /* 节点名先统一算好：同类节点（ImageConcatMulti ×2、五段流程里一排四个
-         GetImageRangeFromBatch）得带序号才分得开。前置行里重名的那几格
-         也算进来一起编号，免得四个「帧数」的角标长得一模一样 */
-      const leadCnt = new Map();
-      for (const f of lead) { const n = cnName(f); leadCnt.set(n, (leadCnt.get(n) || 0) + 1); }
-      const needIds = [];
-      for (const [, owners] of list) for (const nid of owners.keys()) if (!needIds.includes(nid)) needIds.push(nid);
-      for (const f of lead) {
-        if (leadCnt.get(cnName(f)) < 2) continue;
-        if (!needIds.includes(f.nodeId)) needIds.push(f.nodeId);
+      const box = sectionBox(++secNo, "参数", right, false);
+      const sb = box.querySelector(".sec-body");
+      /* 重名的格子挂节点角标；顺序按 S.orders 排（没排过就是上面那版默认顺序） */
+      if (paramFields.length) {
+        sb.appendChild(fieldFlow(node, paramFields, "param", tagMaker(node, paramFields)));
       }
-      const nameOf = new Map();
-      const baseCount = new Map();
-      for (const nid of needIds) {
-        const b = nodeLabel(node, nid);
-        baseCount.set(b, (baseCount.get(b) || 0) + 1);
-      }
-      const capSeen = new Map();
-      for (const nid of needIds) {
-        const base = nodeLabel(node, nid);
-        const dup = (capSeen.get(base) || 0) + 1;
-        capSeen.set(base, dup);
-        /* 序号放前面：角标窄的时候会被省略号截掉尾巴，
-           序号要是在后面就跟着一起没了，四格又变成一模一样。
-           同名的都给序号（包括第一个），不然第一格没号、后面从 #2 起，看着像缺了一个 */
-        nameOf.set(nid, baseCount.get(base) > 1 ? `#${dup} ${base}` : base);
-      }
-      const leadTag = (f) => leadCnt.get(cnName(f)) < 2 ? null : { tag: nameOf.get(f.nodeId) };
-      if (split) {
-        for (const [st, owners] of list) for (const fs of owners.values()) for (const f of fs) f._pass = st;
-      }
-      /* 前置行里也有重名的（五段工作流一排四个「帧数」，导演台两个「分段模式」），
-         这些也得带节点角标，否则四格长得一模一样，改哪个全靠猜 */
-
-      /* 前置行（画幅比例 / 画幅策略 / 分段模式 / 时长）紧跟提示词，这三格是「先定框架」：
-         模式决定吃哪种素材，画幅和时长决定宽高、帧数、步数。
-         单数时右下角会空半格 —— 把下面第一格挪上来补满，正好是「后面的参数往前移」 */
-      const taken = new Set();
-      const leadCells = lead.map(f => fieldControl(f, node, leadTag(f)));
-      if (lead.length && lead.length % 2 && list.length) {
-        const first = (orderOf.get(list[0][0]) || [])[0];
-        if (first) {
-          taken.add(first);
-          leadCells.push(fieldControl(first, node, multiNode ? { tag: nameOf.get(first.nodeId) } : null));
-        }
-      }
-      if (leadCells.length) sb.appendChild(grid2(leadCells));
-
-      for (const [st, owners] of list) {
-        const blk = document.createElement("div");
-        blk.className = "pass-blk p" + st;
-        const seq = (orderOf.get(st) || []).filter(f => !taken.has(f));
-        if (!seq.length) continue;
-        if (split) {
-          const h = document.createElement("div");
-          h.className = "pass-head";
-          h.innerHTML = `<span class="pass-tag">${PASS_CN[st] || st + " 采"}</span>`
-            + `<span class="pass-n">${seq.length} 项</span>`;
-          blk.appendChild(h);
-        }
-        /* 参数连着排成一张两列的网，不再一个节点一小块：
-           单字段节点（分辨率只有一个总像素、每个 VideoCombine 只有一个帧率）
-           以前各占一行、右边空半格，几个凑起来就是一大片空白。
-           节点名缩成角标挂在该组第一格的标签右边，归属照样看得清 */
-        let prevNid = null;
-        blk.appendChild(grid2(seq.map(f => {
-          const head = multiNode && f.nodeId !== prevNid;
-          prevNid = f.nodeId;
-          return fieldControl(f, node, head ? { tag: nameOf.get(f.nodeId) } : null);
-        })));
-        sb.appendChild(blk);
-      }
-
-      if (g.other.length) {
-        const d = document.createElement("details");
-        d.innerHTML = `<summary style="cursor:pointer;font-size:10.5px;color:var(--txt-3);list-style:none">更多参数 (${g.other.length})</summary>`;
-        for (const f of g.other) d.appendChild(fieldControl(f, node));
-        sb.appendChild(d);
-      }
+      /* 画布不提供编辑的那几格（ComfyUI 面板接管 / 由画幅算出的宽高）收在参数区末尾：
+         拖不动的东西夹在可拖的中间最碍事 */
       if (locked.length) sb.appendChild(lockedBox(locked, node));
       body.appendChild(box);
     }
+
 
     /* ③ LoRA：名字在上面、强度紧贴在这条下面，一眼看出哪个强度配的哪个 LoRA */
     const loraOrder = [];
@@ -3594,12 +3683,14 @@ function renderNode(node) {
       body.appendChild(box);
     }
 
-    /* ④ 模型选择（LoRA 已经单独成段，这里只剩 UNET / CLIP / VAE 这些） */
+    /* ④ 模型：UNET / CLIP / VAE 这些（LoRA 单独一区）。
+       顺序同样可以拖 —— 谁排前面纯看习惯，不影响加载链（链是按接线走的） */
     if (g.model.length) {
       const miss = g.model.filter(f => missOf(f, node.params[f.key] ?? f.value));
-      const box = sectionBox(++secNo, "模型选择", miss.length ? `⚠ 缺 ${miss.length}` : g.model.length, miss.length > 0);
+      const box = sectionBox(++secNo, "模型", miss.length ? `⚠ 缺 ${miss.length}` : g.model.length, miss.length > 0);
       const sb = box.querySelector(".sec-body");
-      for (const f of g.model) sb.appendChild(fieldControl(f, node));
+      /* 两个 VAE、两套 CLIP 是常事，重名就挂角标 */
+      sb.appendChild(fieldFlow(node, g.model, "model", tagMaker(node, g.model)));
       body.appendChild(box);
     }
   } else if (node.kind === "input") {
@@ -5786,6 +5877,9 @@ function save() {
   if (S.restoring) return;
   const data = {
     v: 1, view: view.view, seq: S.seq,
+    /* 用户拖出来的参数排列（按工作流文件名记）：跟着画布一起存，
+       重开以后面板还是他排好的那个样子 */
+    orders: S.orders,
     nodes: S.nodes.map(n => ({
       id: n.id, kind: n.kind, file: n.file, name: n.name, wfKind: n.wfKind,
       inKind: n.inKind, value: n.value, sub: n.sub, sType: n.sType,
@@ -5813,6 +5907,7 @@ function restore() {
     if (!raw) return;
     const d = JSON.parse(raw);
     S.seq = d.seq || 1;
+    S.orders = d.orders && typeof d.orders === "object" ? d.orders : {};
     S.edges = Array.isArray(d.edges) ? d.edges : [];
     S._pending = Array.isArray(d.nodes) ? d.nodes : [];
     S.restoring = S._pending.length > 0;      // 恢复完成前禁止 save 覆盖
